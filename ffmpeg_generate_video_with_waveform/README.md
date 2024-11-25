@@ -1,5 +1,5 @@
 # Description 
-This script will generate video from mp3 audio file. This simple wrapper script will use given jpg file as background and generate waveform on top of it based on audio file.
+This script will generate video from mp3 audio file. This simple wrapper script will use given jpg file as background and generate waveform on top of it based on audio file. I'm putting it here so that I won't lose it anytime soon.
 
 # Requirements
 - ffmpeg installed - run in terminal `brew install ffmpeg` on mac
