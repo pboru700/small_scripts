@@ -10,8 +10,8 @@ Script requires 3 arguments in correct order:
 - audio_file - path to mp3 audio file
 - output_video_file - path to store mp4 output file
 
-Example:
-Assuming all files ans cript are in user home directory:
+# Example
+Assuming all files and script are in user home directory:
 ```
 ~/generate_video.sh ~/background_image.jpg ~/audio_file.mp3 ~/output_video_file.mp4
 ```
