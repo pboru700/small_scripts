@@ -11,6 +11,8 @@ Script requires 3 arguments in correct order:
 - output_video_file - path to store mp4 output file
 
 Example:
+Assuming all files ans cript are in user home directory:
 ```
 ~/generate_video.sh ~/background_image.jpg ~/audio_file.mp3 ~/output_video_file.mp4
 ```
+This will output video file in the same directory.
