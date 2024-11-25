@@ -8,9 +8,9 @@ This script will generate video from mp3 audio file. Script will use given jpg f
 Script requires 3 arguments in correct order:
 - background_image - path to jpg file
 - audio_file - path to mp3 audio file
-- output file - path to store mp4 output file
+- output_video_file - path to store mp4 output file
 
 Example:
 ```
-~/generate_video.sh ~/background.jpg ~/audio_file.mp3 ~/output_video_file.mp4
+~/generate_video.sh ~/background_image.jpg ~/audio_file.mp3 ~/output_video_file.mp4
 ```
