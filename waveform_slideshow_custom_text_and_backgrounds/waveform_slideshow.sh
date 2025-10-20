@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# waveform_slideshow_with_bar_fixed_numbers.sh
+# waveform_slideshow_with_bar_fixed_numbers.sh (locale-safe + valid FFmpeg formats)
 #
-# Usage (example):
-# ./waveform_slideshow_with_bar_fixed_numbers.sh ./imgs lofi.mp3 out.mp4 2 0.5 1280 720 120 60 "#003366@0.9" "Now playing — Lofi Mix" 36 /Library/Fonts/Arial.ttf fade
-#
-# All positions (bar y, text y, waveform y) are computed in shell as numeric constants
-# to avoid expression parsing incompatibilities in ffmpeg builds.
+# Usage example:
+# ./waveform_slideshow_with_bar_fixed_numbers.sh ./imgs lofi.mp3 out.mp4 10 0.5 1920 1080 240 60 "#002244@0.8" "Galactic Cruise" 36 /Library/Fonts/Arial.ttf fade
 
 if (( $# < 3 )); then
   echo "Usage: $0 IMAGES_DIR AUDIO_FILE OUTPUT_FILE [SECONDS_PER_IMAGE] [TRANSITION_DUR] [WIDTH] [HEIGHT] [WAVE_H] [BAR_H] [BAR_COLOR] [TEXT] [TEXT_SIZE] [FONTFILE] [XFADENAME]" >&2
@@ -51,14 +48,14 @@ audio_duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$au
 audio_duration="$(printf '%s' "$audio_duration" | awk '{$1=$1;print}')"
 if [[ -z "$audio_duration" ]]; then echo "Could not determine audio duration (ffprobe failed)." >&2; exit 1; fi
 
-# needed images (ceil)
-needed_images=$(awk -v d="$audio_duration" -v s="$seconds_per_image" 'BEGIN { if (s<=0) s=1; print int((d + s - 1e-9)/s) }')
+# needed images (ceil) — force C locale for numeric formatting
+needed_images=$(LC_NUMERIC=C awk -v d="$audio_duration" -v s="$seconds_per_image" 'BEGIN { if (s<=0) s=1; print int((d + s - 1e-9)/s) }')
 if (( needed_images < 1 )); then needed_images=1; fi
 
-# adjust transition duration if >= per-image duration
+# adjust transition duration if >= per-image duration (C locale)
 D="$seconds_per_image"
 T="$transition_dur"
-okT=$(awk -v D="$D" -v T="$T" 'BEGIN { if (T >= D) { printf "%.6f", D/2 } else { printf "%.6f", T } }')
+okT=$(LC_NUMERIC=C awk -v D="$D" -v T="$T" 'BEGIN { if (T >= D) { printf "%.6f", D/2 } else { printf "%.6f", T } }')
 if [[ "$okT" != "$T" ]]; then
   echo "Warning: transition duration ($T) >= per-image duration ($D). Reducing to $okT"
   transition_dur="$okT"
@@ -82,16 +79,11 @@ escape_drawtext() {
 }
 escaped_text="$(escape_drawtext "$text")"
 
-# Compute numeric positions (all numbers, no ffmpeg variables)
-# drawbox_y: top of the bar (y coordinate)
+# Compute numeric positions (all numbers, no ffmpeg variables) — use C locale for floats
 drawbox_y=$(( height - bar_h ))
-# approximate text vertical centering inside bar using text_size as approximation
-# text_y = (top of bar) + (bar_h - text_size)/2
-# We'll allow decimals, so use awk for precise float
-drawtext_y=$(awk -v top="$drawbox_y" -v bh="$bar_h" -v ts="$text_size" 'BEGIN{ printf "%.2f", top + ( (bh - ts) / 2 ) }')
-# waveform y (place above bar with margin)
-#overlay_y=$(awk -v h="$height" -v bh="$bar_h" -v wh="$wave_h" -v m="$wave_margin" 'BEGIN{ printf "%.2f", h - bh - wh - m }')
-overlay_y=$(awk -v h="$height" -v wh="$wave_h" 'BEGIN{ printf "%.2f", (h - wh) / 2 }')
+drawtext_y=$(LC_NUMERIC=C awk -v top="$drawbox_y" -v bh="$bar_h" -v ts="$text_size" 'BEGIN{ printf "%.2f", top + ( (bh - ts) / 2 ) }')
+# center waveform vertically (as you requested)
+overlay_y=$(LC_NUMERIC=C awk -v h="$height" -v wh="$wave_h" 'BEGIN{ printf "%.2f", (h - wh) / 2 }')
 
 # build ffmpeg args
 ffargs=()
@@ -99,10 +91,10 @@ for img in "${inputs[@]}"; do ffargs+=( -loop 1 -t "$D" -i "$img" ); done
 audio_index=${#inputs[@]}
 ffargs+=( -i "$audio_file" )
 
-# step for xfade offsets
-step=$(awk -v D="$D" -v T="$transition_dur" 'BEGIN { printf "%.6f", (D - T) }')
+# step for xfade offsets — C locale
+step=$(LC_NUMERIC=C awk -v D="$D" -v T="$transition_dur" 'BEGIN { printf "%.6f", (D - T) }')
 
-# build filter_complex using numeric constants for y/x positions
+# build filter_complex using numeric constants for y/x positions and valid format names
 fc=""
 
 # scale/prepare inputs
@@ -110,7 +102,7 @@ for ((i=0;i<${#inputs[@]};i++)); do
   fc+="[${i}:v]scale=${width}:${height},format=rgba,setsar=1,trim=duration=${D},setpts=PTS-STARTPTS[v${i}];"
 done
 
-# chain xfade
+# chain xfade (use format=yuv420p, numeric offsets)
 if (( ${#inputs[@]} == 1 )); then
   fc+="[v0]format=yuv420p[slide];"
 else
@@ -118,8 +110,9 @@ else
     if (( k == 0 )); then in1="[v0]"; else in1="[xf$k]"; fi
     in2="[v$((k+1))]"
     n=$((k+1))
-    offset=$(awk -v s="$step" -v n="$n" 'BEGIN { printf "%.6f", s * n }')
+    offset=$(LC_NUMERIC=C awk -v s="$step" -v n="$n" 'BEGIN { printf "%.6f", s * n }')
     out_label="xf$((k+1))"
+    # use format=yuv420p for xfade output
     fc+="${in1}${in2}xfade=transition=${xfade_name}:duration=${transition_dur}:offset=${offset},format=yuv420p[${out_label}];"
   done
   last=$(( ${#inputs[@]} - 1 ))
@@ -133,16 +126,15 @@ if [[ -n "$escaped_text" ]]; then
   else
     drawtext_fontpart=""
   fi
-  # note: x for drawtext uses (w-text_w)/2 which is allowed; y uses a numeric value
   fc+="[slide]drawbox=x=0:y=${drawbox_y}:w=iw:h=${bar_h}:color=${bar_color}:t=fill,${drawtext_fontpart}drawtext=text='${escaped_text}':fontcolor=white:fontsize=${text_size}:x=(w-text_w)/2:y=${drawtext_y}:box=0[slide_bar];"
 else
   fc+="[slide]drawbox=x=0:y=${drawbox_y}:w=iw:h=${bar_h}:color=${bar_color}:t=fill[slide_bar];"
 fi
 
-# waveform (yuva) from audio
-fc+="[${audio_index}:a]showwaves=s=${width}x${wave_h}:mode=cline:colors=0xff1646@0.6,format=yuva420p[wave];"
+# waveform (yuva420p) from audio — sized width x wave_h
+fc+="[${audio_index}:a]showwaves=s=${width}x${wave_h}:mode=cline:colors=${bar_color}@0.6,format=yuva420p[wave];"
 
-# overlay waveform (y numeric)
+# overlay waveform (numeric overlay_y, centered horizontally)
 fc+="[slide_bar][wave]overlay=x=(W-w)/2:y=${overlay_y}:format=auto[outv]"
 
 # assemble and run ffmpeg
