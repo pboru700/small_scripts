@@ -1,138 +1,129 @@
-# 🎵 Waveform Slideshow Video Generator
+# Waveform Slideshow Generator
 
-`waveform_slideshow.sh` is a Bash script that creates an **MP4 video slideshow** synchronized with an **audio waveform visualization**.  
-It cycles through a folder of images, changing the background every few seconds, adds **smooth transitions**, and overlays a **colored bar with custom text** at the bottom.
+`waveform_argparse.py` builds an MP4 slideshow from a folder of images and an MP3 audio track. Images are scaled to fit a fixed resolution while preserving aspect ratio, placed over a blurred stretched version of themselves, and transitioned with crossfades. A semi‑transparent bottom bar displays custom text and an opaque centered waveform visualization derived from the audio. Optionally a logo can be overlaid.
 
-Perfect for generating music videos, lofi visuals, or background animations for YouTube or social posts.
+## Features
+- Fixed output resolution (e.g. 1920x1080)
+- Contain + upscale/downscale image scaling (no cropping, aspect preserved)
+- Blurred full‑frame background (stretched source image + blur)
+- Crossfade transitions (`xfade` with selectable style)
+- Semi‑transparent bottom bar with centered text
+- Solid centered waveform (FFmpeg `showwaves` mode=cline)
+- Loop images if audio duration exceeds total per‑image time
+- Optional logo overlay bottom‑left
+- Legacy `--color` flag still supported (maps to `--bar-color` + `--bar-alpha`)
+
+## Requirements
+- Python 3.8+
+- FFmpeg / FFprobe available in `PATH`
+
+## Installation
+No extra Python dependencies are required beyond the standard library. Ensure FFmpeg is installed:
+
+```bash
+# macOS (Homebrew)
+brew install ffmpeg
+```
+
+Place your images and audio in accessible paths.
+
+## Basic Usage
+```bash
+python3 waveform_argparse.py \
+  --images imgs \
+  --audio track.mp3 \
+  --output out.mp4 \
+  --width 1920 --height 1080 \
+  --seconds-per-image 10 \
+  --fade-duration 0.5 \
+  --wave-height 240 \
+  --bar-height 120 \
+  --bar-color "#000000" \
+  --bar-alpha 0.7 \
+  --text "Sample Title" \
+  --text-size 42 \
+  --font /Library/Fonts/Arial.ttf \
+  --fade-name fade \
+  --logo logo.png
+```
+
+### Legacy Flag Example
+```bash
+python3 waveform_argparse.py \
+  --images imgs \
+  --audio track.mp3 \
+  --output out.mp4 \
+  --width 1920 --height 1080 \
+  --seconds-per-image 10 \
+  --fade-duration 0.5 \
+  --wave-height 480 \
+  --bar-height 120 \
+  --color "#035358@0.7" \
+  --text "Recenzja Bonfire" \
+  --text-size 42 \
+  --font /Library/Fonts/Arial.ttf \
+  --fade-name fade \
+  --logo logo.png
+```
+
+## Argument Reference
+- `--images`: Directory with input images (`.jpg`, `.jpeg`, `.png`, `.gif`).
+- `--audio`: MP3 audio track.
+- `--output`: Output MP4 file path.
+- `--width`, `--height`: Target video dimensions.
+- `--seconds-per-image`: Duration each image is shown (excluding fade overlap portion).
+- `--fade-duration`: Duration of crossfade; auto‑reduced to half if >= seconds per image.
+- `--wave-height`: Height of waveform overlay.
+- `--bar-height`: Pixel height of bottom bar (0 disables bar & text).
+- `--bar-color`: Hex base color for bar (e.g. `#222222`).
+- `--bar-alpha`: Alpha for bottom bar (only bar uses transparency; waveform is opaque).
+- `--color` (deprecated): Combined hex@alpha form; overrides `--bar-color`/`--bar-alpha` if present.
+- `--text`: Text string placed centered in bar.
+- `--text-size`: Font size.
+- `--font`: Optional font file path for drawtext (fallback to default if omitted).
+- `--fade-name`: FFmpeg `xfade` transition type (e.g. `fade`, `wipeleft`, `circleopen`).
+- `--logo`: Optional logo image placed bottom‑left (scaled to 115x96).
+
+## Scaling Logic
+Foreground scaling formula:
+- If source aspect ≥ target aspect ("wider"), scale width to target width; height auto.
+- Else scale height to target height; width auto.
+- Smaller images are upscaled so one dimension always matches target; other dimension ≤ target.
+- A blurred stretched copy of the original (scaled exactly to target) becomes the background.
+
+## Waveform Rendering
+Uses `showwaves` with `mode=cline` producing vertical bars from center for a solid wave. Color derived from bar base color (alpha ignored).
+
+## Transitions
+Crossfades chained between consecutive image segments using FFmpeg `xfade`. Offset = `(seconds_per_image - fade_duration) * index`.
+
+## Looping Behavior
+If audio duration requires more images than provided, the image list wraps (modulo indexing) until enough segments are created.
+
+## Exit Conditions & Errors
+Script exits with an error message if:
+- FFmpeg/FFprobe missing
+- Images/audio/logo paths invalid
+- No images discovered
+- `ffprobe` fails to read audio duration
+- `ffmpeg` returns non‑zero (encoding error)
+
+## Tips
+- Use a lossless or high‑quality source audio; video CRF 18 is visually good. Adjust CRF (lower = higher quality, larger file).
+- For darker backgrounds, choose a semi‑transparent bar color with moderate alpha (0.5–0.8) to keep text legible.
+- Consider experimenting with different `--fade-name` transitions for stylistic variety.
+
+## Example Higher Quality Encoding
+You can manually tweak after generation:
+```bash
+ffmpeg -i out.mp4 -c:v libx264 -crf 15 -preset slow -c:a copy out_hq.mp4
+```
+
+## Future Enhancements (Ideas)
+- Optional `--wave-color` separate from bar.
+- Custom logo position/size flags.
+- Progress percentage output.
+- Support for additional audio formats.
 
 ---
-
-## 🧩 Features
-
-✅ Uses all images in a specified folder  
-✅ Smooth crossfade transitions between images  
-✅ Synchronized audio waveform animation  
-✅ Customizable resolution, duration, colors, and text  
-✅ Compatible with macOS, Linux, and ffmpeg ≥ 5.0  
-✅ No external dependencies besides **ffmpeg**
-
----
-
-## ⚙️ Requirements
-
-- **ffmpeg** (must support `xfade`, `showwaves`, `drawbox`, `drawtext`)
-- **bash** (v4 or higher recommended)
-
-You can check your ffmpeg version with:
-```bash
-ffmpeg -version
-```
-
-If missing, install via:
-- macOS: brew install ffmpeg
-- Ubuntu/Debian: sudo apt install ffmpeg
-- Fedora: sudo dnf install ffmpeg
-
-## 🚀 Usage
-
-```bash
-./waveform_slideshow.sh \
-  <images_dir> <audio_file> <output_file> \
-  [seconds_per_image] [transition_dur] [width] [height] \
-  [wave_height] [bar_height] [bar_color] \
-  [text] [text_size] [fontfile] [xfade_transition]
-```
-### Example
-
-```bash
-./waveform_slideshow_with_bar_fixed_numbers.sh \
-  ./imgs lofi.mp3 output.mp4 \
-  20 1.0 1280 720 120 60 "#003366@0.9" \
-  "Now playing — Lofi Beats" 36 /Library/Fonts/Arial.ttf fade
-```
-
-This example will:
-- Create a 1280x720 video
-- Cycle images from ./imgs/ every 20 seconds
-- Add a 1s crossfade between slides
-- Overlay a waveform (height = 120px) above a blue bar (60px tall)
-- Render the text “Now playing — Lofi Beats” in white, centered on the bar
-- Use the fade transition style
-
-## 🎛️ Parameters
-
-| Parameter           | Default       | Description                                                       |
-| ------------------- | ------------- | ----------------------------------------------------------------- |
-| `<images_dir>`      | *(required)*  | Directory containing `.jpg`, `.jpeg`, `.png`, or `.gif` files     |
-| `<audio_file>`      | *(required)*  | Path to input audio file (MP3, WAV, etc.)                         |
-| `<output_file>`     | *(required)*  | Path for output MP4 video                                         |
-| `seconds_per_image` | 20            | Duration each image stays on screen                               |
-| `transition_dur`    | 1.0           | Duration of crossfade transition                                  |
-| `width`             | 400           | Video width in pixels                                             |
-| `height`            | 400           | Video height in pixels                                            |
-| `wave_height`       | 120           | Height of waveform visualization                                  |
-| `bar_height`        | 60            | Height of the colored bar at bottom                               |
-| `bar_color`         | "#000000@0.7" | Color of bar (supports hex + alpha, e.g., `#003366@0.9`)          |
-| `text`              | *(empty)*     | Text rendered over the bottom bar                                 |
-| `text_size`         | 24            | Font size in pixels                                               |
-| `fontfile`          | *(empty)*     | Path to a TTF/OTF font (optional; system default if not provided) |
-| `xfade_transition`  | fade          | ffmpeg’s xfade style (`fade`, `wipeleft`, `circleopen`, etc.)     |
-
-## 🖼️ Output Layers
-
-```bash
- ┌──────────────────────────────┐
- │ Background image slideshow   │ ← transitions every N seconds
- │ with xfade animation         │
- ├──────────────────────────────┤
- │ Waveform visualization       │ ← matches audio length
- │ (centered horizontally)      │
- ├──────────────────────────────┤
- │ Colored bar with text        │ ← spans full width, at bottom
- └──────────────────────────────┘
-```
-
-## 🎨 Transition Types
-
-You can choose from any of ffmpeg’s built-in transitions for xfade_transition, e.g.:
-- fade
-- wipeleft, wiperight, slideup, slidedown
-- circleopen, circleclose
-- smoothleft, smoothright, smoothup, smoothdown
-
-### Example
-
-```bash
-xfade_transition=circleopen
-```
-
-## 💡 Tips
-Keep transition_dur < seconds_per_image for smooth transitions
-To make text always visible, use a semi-transparent bar color like #000000@0.6
-You can install additional fonts (e.g. brew install fontconfig and place TTFs in /Library/Fonts)
-
-## 🧰 Example Output
-
-```bash
-./waveform_slideshow_with_bar_fixed_numbers.sh \
-  ./images lofi.mp3 lofi_output.mp4 \
-  15 0.8 1920 1080 160 80 "#222244@0.8" \
-  "LoFi Vibes — Study & Chill" 40 /Library/Fonts/Arial.ttf smoothleft
-```
-
-Output layout:
-- 1080p widescreen video
-- 15s per image with smooth horizontal transition
-- Waveform centered above a dark semi-transparent bar
-- White text overlay at bottom: “LoFi Vibes — Study & Chill”
-
-## 🪲 Troubleshooting
-❌ Error: Undefined constant or missing '('
-→ Your ffmpeg doesn’t like inline math expressions — this version precomputes them in shell, so it’s already fixed.
-❌ Error: fontfile not found
-→ Provide full path to a .ttf or .otf file. Example: /Library/Fonts/Arial.ttf
-❌ Video has only one image
-→ Make sure image filenames have proper extensions (.jpg, .png, etc.) and directory path doesn’t contain trailing / typos.
-
-## 📄 License
-MIT License — use freely, modify, and share.
+Feel free to modify and extend the script; contributions can add configurability while keeping defaults simple.
