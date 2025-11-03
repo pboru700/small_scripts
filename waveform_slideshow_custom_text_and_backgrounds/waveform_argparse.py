@@ -183,7 +183,7 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
     # Logo
     if logo_file:
         fc_parts.append(
-            f"[{logo_index}:v]format=rgba,setsar=1,scale=115:96[logo_scaled]"
+            f"[{logo_index}:v]format=rgba,setsar=1,scale=115:115[logo_scaled]"
         )
         fc_parts.append(
             "[mid_fixed][logo_scaled]overlay=x=10:y=H-h-10:format=auto[outv]"
