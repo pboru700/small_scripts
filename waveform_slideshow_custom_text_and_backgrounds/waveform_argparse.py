@@ -122,7 +122,8 @@ def convert_images_to_jpeg(src_list, tmpdir, quality=2):
 def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_image, transition_dur,
                           width, height, wave_h, bar_h, bar_color, text, text_size, fontfile,
                           xfade_name, overlay_y, drawbox_y, drawtext_y, logo_file,
-                          blur_strength: int, wave_scale: float, force_rgba: bool):
+                          blur_strength: int, wave_scale: float, force_rgba: bool,
+                          wave_direction: str, wave_round: float):
     step = seconds_per_image - transition_dur
     fc_parts = []
 
@@ -174,17 +175,44 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
     else:
         fc_parts.append("[slide]copy[slide_bar]")
 
-    # Waveform (optionally generated at reduced horizontal resolution then scaled up to save CPU)
+    # Waveform generation with directional options.
+    # wave_direction: 'both' (default cline centered), 'top', 'bottom'.
     wave_color = ffmpeg_wave_color(bar_color)
     gen_wave_w = max(2, int(width * max(0.05, min(wave_scale, 1.0))))
+    # If we want only top or bottom, generate at double height then crop half to keep full amplitude feel.
+    if wave_direction in ("top", "bottom"):
+        gen_wave_h = wave_h * 2
+    else:
+        gen_wave_h = wave_h
     wave_fmt = "yuva420p" if force_rgba else "yuva420p"
     fc_parts.append(
-        f"[{audio_index}:a]showwaves=s={gen_wave_w}x{wave_h}:mode=cline:colors={wave_color},format={wave_fmt}[wave_raw]"
+        f"[{audio_index}:a]showwaves=s={gen_wave_w}x{gen_wave_h}:mode=cline:colors={wave_color},format={wave_fmt}[wave_raw]"
     )
+    # Horizontal upscale if reduced generation width
     if gen_wave_w != width:
-        fc_parts.append(f"[wave_raw]scale={width}:{wave_h}:flags=bilinear[wave]")
+        fc_parts.append(f"[wave_raw]scale={width}:{gen_wave_h}:flags=bilinear[wave_scaled_w]")
+        wave_current = "wave_scaled_w"
     else:
-        fc_parts.append(f"[wave_raw]copy[wave]")
+        wave_current = "wave_raw"
+    # Crop for directional single-sided waveform -> produce [wave_base]
+    if wave_direction == "top":
+        fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y=0[wave_base]")
+    elif wave_direction == "bottom":
+        fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y={wave_h}[wave_base]")
+    else:
+        if gen_wave_h != wave_h:
+            fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y={(gen_wave_h-wave_h)//2}[wave_base]")
+        else:
+            fc_parts.append(f"[{wave_current}]copy[wave_base]")
+
+    # Optional rounding (soften edges) using gaussian blur; small sigma (e.g. 1.0) gives subtle rounding.
+    if wave_round and wave_round > 0:
+        # Limit sigma to reasonable range to avoid over-blur
+        sigma = min(10.0, max(0.1, wave_round))
+        fc_parts.append(f"[wave_base]gblur=sigma={sigma}:steps=1[wave]")
+    else:
+        fc_parts.append("[wave_base]copy[wave]")
+
     fc_parts.append(
         f"[slide_bar][wave]overlay=x=(W-w)/2:y={overlay_y:.2f}:format=auto[mid]"
     )
@@ -204,32 +232,6 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
 
     return ";".join(fc_parts)
 
-
-# def build_ffmpeg_command(converted_inputs, audio_file, logo_file, filter_complex,
-#                           seconds_per_image, output_file, audio_index):
-#     ff_args = ["ffmpeg", "-y"]
-#     for img in converted_inputs:
-#         ff_args += ["-loop", "1", "-t", f"{seconds_per_image:.6f}", "-i", img]
-#     ff_args += ["-i", audio_file]
-#     if logo_file:
-#         ff_args += ["-i", logo_file]
-
-#     ff_args += [
-#         "-filter_complex", filter_complex,
-#         "-map", "[outv]", "-map", f"{audio_index}:a",
-#         "-c:v", "h264_videotoolbox",
-#         "-b:v", "8M",
-#         "-maxrate", "10M",
-#         "-bufsize", "20M",
-#         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-#         "-c:a", "aac",
-#         "-pix_fmt", "yuv420p",
-#         "-hwaccel", "videotoolbox",
-#         "-hwaccel_output_format", "videotoolbox",
-#         "-shortest",
-#         output_file
-#     ]
-#     return ff_args
 def build_ffmpeg_command(converted_inputs, audio_file, logo_file, filter_complex,
                           seconds_per_image, output_file, audio_index,
                           encoder: str, bitrate: Optional[str], crf: Optional[int], threads: Optional[int]):
@@ -306,6 +308,8 @@ def parse_args():
     p.add_argument("--blur", type=int, default=10, help="Background blur strength (boxblur radius). Lower improves speed.")
     p.add_argument("--wave-scale", type=float, default=1.0, help="Horizontal scale factor (0.1-1.0) to generate waveform at reduced width for performance, then upscale.")
     p.add_argument("--force-rgba", action="store_true", help="Force RGBA intermediate pixel format (may slow down; use only if transparency processing explicitly needed).")
+    p.add_argument("--wave-direction", default="both", choices=["both","top","bottom"], help="Waveform style: both (centered), top (single-sided), bottom (single-sided).")
+    p.add_argument("--wave-round", type=float, default=0.0, help="Apply slight gaussian blur (sigma) to waveform to produce rounded/antialiased ends (0 disables).")
     return p.parse_args()
 
 
@@ -378,7 +382,8 @@ def main():
             args.width, args.height, args.wave_height, args.bar_height, bar_color,
             args.text, args.text_size, args.font, args.fade_name,
             overlay_y, drawbox_y, drawtext_y, args.logo,
-            blur_strength=args.blur, wave_scale=args.wave_scale, force_rgba=args.force_rgba
+            blur_strength=args.blur, wave_scale=args.wave_scale, force_rgba=args.force_rgba,
+            wave_direction=args.wave_direction, wave_round=args.wave_round
         )
 
         # Determine encoder auto mode
