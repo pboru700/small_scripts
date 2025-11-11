@@ -34,6 +34,7 @@ import tempfile
 import shutil
 import subprocess
 from math import ceil
+from typing import Optional
 
 SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.gif'}
 
@@ -120,7 +121,9 @@ def convert_images_to_jpeg(src_list, tmpdir, quality=2):
 
 def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_image, transition_dur,
                           width, height, wave_h, bar_h, bar_color, text, text_size, fontfile,
-                          xfade_name, overlay_y, drawbox_y, drawtext_y, logo_file):
+                          xfade_name, overlay_y, drawbox_y, drawtext_y, logo_file,
+                          blur_strength: int, wave_scale: float, force_rgba: bool,
+                          wave_direction: str, wave_round: float):
     step = seconds_per_image - transition_dur
     fc_parts = []
 
@@ -131,19 +134,22 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
         scale_expr = (
             f"scale='if(gte(iw/ih,{target_ar_expr}),{width},-1)':'if(gte(iw/ih,{target_ar_expr}),-1,{height})'"
         )
+        fg_format = "rgba" if force_rgba else "yuva420p"
         fc_parts.append(
-            f"[{i}:v]format=rgba,setsar=1,{scale_expr},trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[fg{i}]"
+            f"[{i}:v]format={fg_format},setsar=1,{scale_expr},trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[fg{i}]"
         )
-        # Background: stretch + blur
+        # Background: stretch + adjustable blur (lower blur_strength improves speed)
+        bg_format = "rgba" if force_rgba else "yuva420p"
         fc_parts.append(
-            f"[{i}:v]format=rgba,setsar=1,scale={width}:{height},boxblur=10:1,trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[bg{i}]"
+            f"[{i}:v]format={bg_format},setsar=1,scale={width}:{height},boxblur={blur_strength}:1,trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[bg{i}]"
         )
         # Overlay fg centered on blurred bg
-        fc_parts.append(f"[bg{i}][fg{i}]overlay=x=(W-w)/2:y=(H-h)/2,format=yuv420p[v{i}]")
+        # Overlay; if alpha path not forced we stay in yuv420p to avoid RGBA conversions
+        fc_parts.append(f"[bg{i}][fg{i}]overlay=x=(W-w)/2:y=(H-h)/2,format=yuva420p[v{i}]")
 
     # Build slideshow with xfade transitions
     if len(converted_inputs) == 1:
-        fc_parts.append("[v0]format=yuv420p[slide]")
+        fc_parts.append("[v0]format=yuva420p[slide]")
     else:
         for k in range(len(converted_inputs) - 1):
             in1 = "[v0]" if k == 0 else f"[xf{k}]"
@@ -153,7 +159,7 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
                 f"{in1}{in2}xfade=transition={xfade_name}:duration={transition_dur:.6f}:offset={offset:.6f},format=yuv420p[xf{k+1}]"
             )
         last = len(converted_inputs) - 1
-        fc_parts.append(f"[xf{last}]format=yuv420p[slide]")
+        fc_parts.append(f"[xf{last}]format=yuva420p[slide]")
 
     # Bar + optional text
     if bar_h > 0:
@@ -169,12 +175,44 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
     else:
         fc_parts.append("[slide]copy[slide_bar]")
 
-    # Waveform
+    # Waveform generation with directional options.
+    # wave_direction: 'both' (default cline centered), 'top', 'bottom'.
     wave_color = ffmpeg_wave_color(bar_color)
-    # Waveform: use 'cline' to draw vertical columns from center for a solid filled look
+    gen_wave_w = max(2, int(width * max(0.05, min(wave_scale, 1.0))))
+    # If we want only top or bottom, generate at double height then crop half to keep full amplitude feel.
+    if wave_direction in ("top", "bottom"):
+        gen_wave_h = wave_h * 2
+    else:
+        gen_wave_h = wave_h
+    wave_fmt = "yuva420p" if force_rgba else "yuva420p"
     fc_parts.append(
-        f"[{audio_index}:a]showwaves=s={width}x{wave_h}:mode=cline:colors={wave_color},format=yuva420p[wave]"
+        f"[{audio_index}:a]showwaves=s={gen_wave_w}x{gen_wave_h}:mode=cline:colors={wave_color},format={wave_fmt}[wave_raw]"
     )
+    # Horizontal upscale if reduced generation width
+    if gen_wave_w != width:
+        fc_parts.append(f"[wave_raw]scale={width}:{gen_wave_h}:flags=bilinear[wave_scaled_w]")
+        wave_current = "wave_scaled_w"
+    else:
+        wave_current = "wave_raw"
+    # Crop for directional single-sided waveform -> produce [wave_base]
+    if wave_direction == "top":
+        fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y=0[wave_base]")
+    elif wave_direction == "bottom":
+        fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y={wave_h}[wave_base]")
+    else:
+        if gen_wave_h != wave_h:
+            fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y={(gen_wave_h-wave_h)//2}[wave_base]")
+        else:
+            fc_parts.append(f"[{wave_current}]copy[wave_base]")
+
+    # Optional rounding (soften edges) using gaussian blur; small sigma (e.g. 1.0) gives subtle rounding.
+    if wave_round and wave_round > 0:
+        # Limit sigma to reasonable range to avoid over-blur
+        sigma = min(10.0, max(0.1, wave_round))
+        fc_parts.append(f"[wave_base]gblur=sigma={sigma}:steps=1[wave]")
+    else:
+        fc_parts.append("[wave_base]copy[wave]")
+
     fc_parts.append(
         f"[slide_bar][wave]overlay=x=(W-w)/2:y={overlay_y:.2f}:format=auto[mid]"
     )
@@ -182,8 +220,9 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
 
     # Logo
     if logo_file:
+        logo_fmt = "rgba" if force_rgba else "yuva420p"
         fc_parts.append(
-            f"[{logo_index}:v]format=rgba,setsar=1,scale=105:105[logo_scaled]"
+            f"[{logo_index}:v]format={logo_fmt},setsar=1,scale=105:105[logo_scaled]"
         )
         fc_parts.append(
             "[mid_fixed][logo_scaled]overlay=x=10:y=H-h-10:format=auto[outv]"
@@ -193,22 +232,51 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
 
     return ";".join(fc_parts)
 
-
 def build_ffmpeg_command(converted_inputs, audio_file, logo_file, filter_complex,
-                          seconds_per_image, output_file, audio_index):
+                          seconds_per_image, output_file, audio_index,
+                          encoder: str, bitrate: Optional[str], crf: Optional[int], threads: Optional[int]):
     ff_args = ["ffmpeg", "-y"]
+    # inputs: one looping image per converted input
     for img in converted_inputs:
         ff_args += ["-loop", "1", "-t", f"{seconds_per_image:.6f}", "-i", img]
+    # audio input
     ff_args += ["-i", audio_file]
+    # optional logo input
     if logo_file:
         ff_args += ["-i", logo_file]
 
-    ff_args += [
-        "-filter_complex", filter_complex,
-        "-map", "[outv]", "-map", f"{audio_index}:a",
-        "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
-        "-c:a", "aac", "-shortest", output_file
-    ]
+    # filtergraph and mapping then encoder options
+    ff_args += ["-filter_complex", filter_complex, "-map", "[outv]", "-map", f"{audio_index}:a"]
+
+    # Video encoding strategy
+    if encoder == "x264":
+        ff_args += ["-c:v", "libx264"]
+        if crf is not None:
+            ff_args += ["-crf", str(crf), "-preset", "veryfast"]
+        if bitrate:
+            ff_args += ["-b:v", bitrate]
+    elif encoder == "vt_h264":
+        # macOS VideoToolbox H.264
+        ff_args += ["-c:v", "h264_videotoolbox"]
+        if bitrate:
+            ff_args += ["-b:v", bitrate]
+        else:
+            # Use quality scale (lower is better); map CRF-like number roughly
+            if crf is not None:
+                q = min(100, max(0, 35 + (crf - 18) * 3))  # heuristic mapping
+                ff_args += ["-q:v", str(q)]
+    elif encoder == "vt_hevc":
+        ff_args += ["-c:v", "hevc_videotoolbox"]
+        if bitrate:
+            ff_args += ["-b:v", bitrate]
+    else:
+        # Fallback
+        ff_args += ["-c:v", "libx264", "-crf", str(crf or 18), "-preset", "veryfast"]
+
+    if threads and encoder == "x264":
+        ff_args += ["-threads", str(threads)]
+
+    ff_args += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", output_file]
     return ff_args
 
 
@@ -232,6 +300,16 @@ def parse_args():
     p.add_argument("--font", default="", help="Optional font file path for drawtext")
     p.add_argument("--fade-name", default="fade", help="FFmpeg xfade transition name (e.g. fade, wipeleft, circleopen)")
     p.add_argument("--logo", default="", help="Optional logo image path")
+    p.add_argument("--wave-y", type=float, default=None, help="Optional Y position (pixels) for waveform overlay (overrides auto-centering)")
+    p.add_argument("--encoder", default="auto", choices=["auto", "x264", "vt_h264", "vt_hevc"], help="Video encoder: auto tries h264_videotoolbox if available on macOS")
+    p.add_argument("--bitrate", help="Target video bitrate (e.g. 6M). If set, used instead of CRF for chosen encoder where applicable.")
+    p.add_argument("--crf", type=int, default=18, help="CRF value for x264 (quality). Ignored if --bitrate provided or hardware encoder without CRF.")
+    p.add_argument("--threads", type=int, help="Threads for libx264 encoding (ignored for VideoToolbox).")
+    p.add_argument("--blur", type=int, default=10, help="Background blur strength (boxblur radius). Lower improves speed.")
+    p.add_argument("--wave-scale", type=float, default=1.0, help="Horizontal scale factor (0.1-1.0) to generate waveform at reduced width for performance, then upscale.")
+    p.add_argument("--force-rgba", action="store_true", help="Force RGBA intermediate pixel format (may slow down; use only if transparency processing explicitly needed).")
+    p.add_argument("--wave-direction", default="both", choices=["both","top","bottom"], help="Waveform style: both (centered), top (single-sided), bottom (single-sided).")
+    p.add_argument("--wave-round", type=float, default=0.0, help="Apply slight gaussian blur (sigma) to waveform to produce rounded/antialiased ends (0 disables).")
     return p.parse_args()
 
 
@@ -274,6 +352,10 @@ def main():
         drawtext_y = drawbox_y + (args.bar_height - args.text_size) / 2.0
         overlay_y = (args.height - args.wave_height) / 2.0
 
+        # If user provided --wave-y, override the computed overlay_y
+        if args.wave_y is not None:
+            overlay_y = float(args.wave_y)
+
         audio_index = len(converted)
         logo_index = audio_index + 1 if args.logo else None
 
@@ -299,12 +381,24 @@ def main():
             converted, audio_index, logo_index, args.seconds_per_image, fade_dur,
             args.width, args.height, args.wave_height, args.bar_height, bar_color,
             args.text, args.text_size, args.font, args.fade_name,
-            overlay_y, drawbox_y, drawtext_y, args.logo
+            overlay_y, drawbox_y, drawtext_y, args.logo,
+            blur_strength=args.blur, wave_scale=args.wave_scale, force_rgba=args.force_rgba,
+            wave_direction=args.wave_direction, wave_round=args.wave_round
         )
+
+        # Determine encoder auto mode
+        encoder_choice = args.encoder
+        if encoder_choice == "auto":
+            # Prefer VideoToolbox on macOS if available
+            if sys.platform == "darwin":
+                encoder_choice = "vt_h264"
+            else:
+                encoder_choice = "x264"
 
         ff_cmd = build_ffmpeg_command(
             converted, args.audio, args.logo, filter_complex,
-            args.seconds_per_image, args.output, audio_index
+            args.seconds_per_image, args.output, audio_index,
+            encoder=encoder_choice, bitrate=args.bitrate, crf=None if args.bitrate else args.crf, threads=args.threads
         )
 
         print("Running ffmpeg (truncated):")
