@@ -83,7 +83,7 @@ def build_drawtext_options(text: str, size: int, fontfile: str, y_pos: float):
         escaped_font = fontfile.replace("'", "\\'")
         parts.append(f"fontfile='{escaped_font}'")
     parts.append(f"text='{escape_drawtext_text(text)}'")
-    parts.append("fontcolor=white")
+    parts.append("fontcolor=#f5ba2c")
     parts.append(f"fontsize={int(size)}")
     parts.append("x=(w-text_w)/2")
     parts.append(f"y={y_pos:.2f}")
@@ -94,10 +94,162 @@ def build_drawtext_options(text: str, size: int, fontfile: str, y_pos: float):
 def ffmpeg_wave_color(base_color: str) -> str:
     """Return opaque waveform color derived from hex base color (ignore alpha)."""
     c = (base_color or '#ffffff').strip()
+    # drawbox/drawtext style often uses "#RRGGBB@A"; waveform should ignore alpha.
+    if '@' in c:
+        c = c.split('@', 1)[0].strip()
     if c.startswith('#') and len(c) == 7:
         return '0x' + c[1:]
     # Accept already in 0xRRGGBB or named color
     return c
+
+
+def slideshow_duration(num_items: int, seconds_per_image: float, transition_dur: float) -> float:
+    if num_items <= 0:
+        return 0.0
+    if num_items == 1:
+        return float(seconds_per_image)
+    step = seconds_per_image - transition_dur
+    return float(seconds_per_image + (num_items - 1) * step)
+
+
+def build_slideshow_only_filter_complex(
+    converted_inputs,
+    seconds_per_image: float,
+    transition_dur: float,
+    width: int,
+    height: int,
+    xfade_name: str,
+    blur_strength: int,
+    force_rgba: bool,
+    out_label: str = "slide",
+):
+    """Build filtergraph that outputs a slideshow video only (no bar/wave/logo)."""
+    step = seconds_per_image - transition_dur
+    fc_parts = []
+
+    target_ar_expr = f"{width}/{height}"  # For readability
+    for i in range(len(converted_inputs)):
+        scale_expr = (
+            f"scale='if(gte(iw/ih,{target_ar_expr}),{width},-1)':'if(gte(iw/ih,{target_ar_expr}),-1,{height})'"
+        )
+        # Keep intermediates in yuva420p (or rgba) so overlay ops are predictable.
+        pix = "rgba" if force_rgba else "yuva420p"
+        fc_parts.append(
+            f"[{i}:v]format={pix},setsar=1,{scale_expr},trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[fg{i}]"
+        )
+        fc_parts.append(
+            f"[{i}:v]format={pix},setsar=1,scale={width}:{height},boxblur={blur_strength}:1,trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[bg{i}]"
+        )
+        fc_parts.append(f"[bg{i}][fg{i}]overlay=x=(W-w)/2:y=(H-h)/2,format=yuv420p[v{i}]")
+
+    if len(converted_inputs) == 1:
+        fc_parts.append(f"[v0]format=yuv420p[{out_label}]")
+    else:
+        for k in range(len(converted_inputs) - 1):
+            in1 = "[v0]" if k == 0 else f"[xf{k}]"
+            in2 = f"[v{k+1}]"
+            offset = step * (k + 1)
+            fc_parts.append(
+                f"{in1}{in2}xfade=transition={xfade_name}:duration={transition_dur:.6f}:offset={offset:.6f},format=yuv420p[xf{k+1}]"
+            )
+        last = len(converted_inputs) - 1
+        fc_parts.append(f"[xf{last}]format=yuv420p[{out_label}]")
+
+    return ";".join(fc_parts)
+
+
+def build_overlay_filter_complex(
+    slide_label: str,
+    audio_index: int,
+    logo_index,
+    width: int,
+    height: int,
+    wave_h: int,
+    bar_h: int,
+    bar_color: str,
+    text: str,
+    text_size: int,
+    fontfile: str,
+    overlay_y: float,
+    drawbox_y: float,
+    drawtext_y: float,
+    logo_file: str,
+    wave_scale: float,
+    force_rgba: bool,
+    wave_direction: str,
+    wave_round: float,
+):
+    fc_parts = []
+    slide_in = f"[{slide_label}]"
+
+    # Bar + optional text
+    if bar_h > 0:
+        if text:
+            drawtext_opts = build_drawtext_options(text, text_size, fontfile, drawtext_y)
+            fc_parts.append(
+                f"{slide_in}drawbox=x=0:y={int(drawbox_y)}:w=iw:h={bar_h}:color={bar_color}:t=fill,drawtext={drawtext_opts}[slide_bar]"
+            )
+        else:
+            fc_parts.append(
+                f"{slide_in}drawbox=x=0:y={int(drawbox_y)}:w=iw:h={bar_h}:color={bar_color}:t=fill[slide_bar]"
+            )
+    else:
+        fc_parts.append(f"{slide_in}copy[slide_bar]")
+
+    # Waveform
+    wave_color = ffmpeg_wave_color(bar_color)
+    gen_wave_w = max(2, int(width * max(0.05, min(wave_scale, 1.0))))
+    gen_wave_h = wave_h * 2 if wave_direction in ("top", "bottom") else wave_h
+    wave_fmt = "yuva420p" if force_rgba else "yuva420p"
+    fc_parts.append(
+        f"[{audio_index}:a]showwaves=s={gen_wave_w}x{gen_wave_h}:mode=cline:colors={wave_color},format={wave_fmt}[wave_raw]"
+    )
+    if gen_wave_w != width:
+        fc_parts.append(f"[wave_raw]scale={width}:{gen_wave_h}:flags=bilinear[wave_scaled_w]")
+        wave_current = "wave_scaled_w"
+    else:
+        wave_current = "wave_raw"
+
+    if wave_direction == "top":
+        fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y=0[wave_base]")
+    elif wave_direction == "bottom":
+        fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y={wave_h}[wave_base]")
+    else:
+        if gen_wave_h != wave_h:
+            fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y={(gen_wave_h - wave_h) // 2}[wave_base]")
+        else:
+            fc_parts.append(f"[{wave_current}]copy[wave_base]")
+
+    if wave_round and wave_round > 0:
+        sigma = min(10.0, max(0.1, wave_round))
+        fc_parts.append(f"[wave_base]gblur=sigma={sigma}:steps=1[wave]")
+    else:
+        fc_parts.append("[wave_base]copy[wave]")
+
+    fc_parts.append(f"[slide_bar][wave]overlay=x=(W-w)/2:y={overlay_y:.2f}:format=auto[mid]")
+    fc_parts.append("[mid]setsar=1[mid_fixed]")
+
+    # Logo
+    if logo_file:
+        logo_fmt = "rgba" if force_rgba else "yuva420p"
+        fc_parts.append(f"[{logo_index}:v]format={logo_fmt},setsar=1,scale=105:105[logo_scaled]")
+        fc_parts.append("[mid_fixed][logo_scaled]overlay=x=10:y=H-h-10:format=auto[outv]")
+    else:
+        fc_parts.append("[mid_fixed]copy[outv]")
+
+    return ";".join(fc_parts)
+
+
+def run_ffmpeg_stream(cmd):
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    try:
+        for line in proc.stdout:
+            print(line, end="")
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.kill()
+        die("Interrupted by user")
+    return proc.returncode
 
 
 def convert_images_to_jpeg(src_list, tmpdir, quality=2):
@@ -310,6 +462,7 @@ def parse_args():
     p.add_argument("--force-rgba", action="store_true", help="Force RGBA intermediate pixel format (may slow down; use only if transparency processing explicitly needed).")
     p.add_argument("--wave-direction", default="both", choices=["both","top","bottom"], help="Waveform style: both (centered), top (single-sided), bottom (single-sided).")
     p.add_argument("--wave-round", type=float, default=0.0, help="Apply slight gaussian blur (sigma) to waveform to produce rounded/antialiased ends (0 disables).")
+    p.add_argument("--max-inputs-per-pass", type=int, default=30, help="Max number of image inputs per ffmpeg pass. Larger audio durations may require chunking to avoid FFmpeg resource exhaustion.")
     return p.parse_args()
 
 
@@ -389,32 +542,142 @@ def main():
         # Determine encoder auto mode
         encoder_choice = args.encoder
         if encoder_choice == "auto":
-            # Prefer VideoToolbox on macOS if available
-            if sys.platform == "darwin":
-                encoder_choice = "vt_h264"
+            encoder_choice = "vt_h264" if sys.platform == "darwin" else "x264"
+
+        if args.max_inputs_per_pass and len(converted) > int(args.max_inputs_per_pass):
+            chunk = max(2, int(args.max_inputs_per_pass))
+            print(f"Large slideshow ({len(converted)} images). Rendering in chunks of {chunk} to avoid ffmpeg resource exhaustion...")
+
+            segments = [converted[i:i + chunk] for i in range(0, len(converted), chunk)]
+            segment_paths = []
+            for si, seg_inputs in enumerate(segments):
+                seg_out = os.path.join(tmpdir, f"segment_{si:03d}.mp4")
+                seg_filter = build_slideshow_only_filter_complex(
+                    seg_inputs,
+                    seconds_per_image=args.seconds_per_image,
+                    transition_dur=fade_dur,
+                    width=args.width,
+                    height=args.height,
+                    xfade_name=args.fade_name,
+                    blur_strength=args.blur,
+                    force_rgba=args.force_rgba,
+                    out_label="slide",
+                )
+
+                seg_cmd = ["ffmpeg", "-y"]
+                for img in seg_inputs:
+                    seg_cmd += ["-loop", "1", "-t", f"{args.seconds_per_image:.6f}", "-i", img]
+                seg_cmd += ["-filter_complex", seg_filter, "-map", "[slide]", "-an"]
+                # Intermediate encode: keep it simple and fast.
+                seg_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast"]
+                if args.threads:
+                    seg_cmd += ["-threads", str(args.threads)]
+                seg_cmd += ["-pix_fmt", "yuv420p", seg_out]
+
+                print(f"Rendering segment {si + 1}/{len(segments)}...")
+                rc = run_ffmpeg_stream(seg_cmd)
+                if rc != 0:
+                    die(f"ffmpeg failed while rendering segment {si} (code {rc})")
+                segment_paths.append(seg_out)
+
+            # Final pass: join segments with xfade, then apply bar/wave/logo with audio.
+            final_cmd = ["ffmpeg", "-y"]
+            for seg in segment_paths:
+                final_cmd += ["-i", seg]
+            final_cmd += ["-i", args.audio]
+            if args.logo:
+                final_cmd += ["-i", args.logo]
+
+            num_segs = len(segment_paths)
+            audio_index = num_segs
+            logo_index = audio_index + 1 if args.logo else None
+
+            fc_parts = []
+            seg_durs = [slideshow_duration(len(s), args.seconds_per_image, fade_dur) for s in segments]
+            for i in range(num_segs):
+                fc_parts.append(f"[{i}:v]setpts=PTS-STARTPTS,format=yuv420p[sv{i}]")
+
+            if num_segs == 1:
+                fc_parts.append("[sv0]copy[slide]")
             else:
-                encoder_choice = "x264"
+                cum = seg_durs[0]
+                for k in range(num_segs - 1):
+                    in1 = "[sv0]" if k == 0 else f"[sxf{k}]"
+                    in2 = f"[sv{k + 1}]"
+                    offset = cum - fade_dur
+                    fc_parts.append(
+                        f"{in1}{in2}xfade=transition={args.fade_name}:duration={fade_dur:.6f}:offset={offset:.6f},format=yuv420p[sxf{k + 1}]"
+                    )
+                    cum += seg_durs[k + 1] - fade_dur
+                fc_parts.append(f"[sxf{num_segs - 1}]copy[slide]")
 
-        ff_cmd = build_ffmpeg_command(
-            converted, args.audio, args.logo, filter_complex,
-            args.seconds_per_image, args.output, audio_index,
-            encoder=encoder_choice, bitrate=args.bitrate, crf=None if args.bitrate else args.crf, threads=args.threads
-        )
+            fc_parts.append(
+                build_overlay_filter_complex(
+                    slide_label="slide",
+                    audio_index=audio_index,
+                    logo_index=logo_index,
+                    width=args.width,
+                    height=args.height,
+                    wave_h=args.wave_height,
+                    bar_h=args.bar_height,
+                    bar_color=bar_color,
+                    text=args.text,
+                    text_size=args.text_size,
+                    fontfile=args.font,
+                    overlay_y=overlay_y,
+                    drawbox_y=drawbox_y,
+                    drawtext_y=drawtext_y,
+                    logo_file=args.logo,
+                    wave_scale=args.wave_scale,
+                    force_rgba=args.force_rgba,
+                    wave_direction=args.wave_direction,
+                    wave_round=args.wave_round,
+                )
+            )
 
-        print("Running ffmpeg (truncated):")
-        print(" ".join(ff_cmd[:10]) + " ... " + " ".join(ff_cmd[-10:]))
+            filter_complex2 = ";".join(fc_parts)
+            final_cmd += ["-filter_complex", filter_complex2, "-map", "[outv]", "-map", f"{audio_index}:a"]
 
-        proc = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        try:
-            for line in proc.stdout:
-                print(line, end="")
-            proc.wait()
-        except KeyboardInterrupt:
-            proc.kill()
-            die("Interrupted by user")
+            # Use requested encoder settings for final output
+            if encoder_choice == "x264":
+                final_cmd += ["-c:v", "libx264"]
+                if args.bitrate:
+                    final_cmd += ["-b:v", args.bitrate]
+                else:
+                    final_cmd += ["-crf", str(args.crf), "-preset", "veryfast"]
+                if args.threads:
+                    final_cmd += ["-threads", str(args.threads)]
+            elif encoder_choice == "vt_h264":
+                final_cmd += ["-c:v", "h264_videotoolbox"]
+                if args.bitrate:
+                    final_cmd += ["-b:v", args.bitrate]
+            elif encoder_choice == "vt_hevc":
+                final_cmd += ["-c:v", "hevc_videotoolbox"]
+                if args.bitrate:
+                    final_cmd += ["-b:v", args.bitrate]
+            else:
+                final_cmd += ["-c:v", "libx264", "-crf", str(args.crf), "-preset", "veryfast"]
 
-        if proc.returncode != 0:
-            die(f"ffmpeg failed with code {proc.returncode}")
+            final_cmd += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", args.output]
+
+            print("Running ffmpeg (final pass, truncated):")
+            print(" ".join(final_cmd[:10]) + " ... " + " ".join(final_cmd[-10:]))
+            rc = run_ffmpeg_stream(final_cmd)
+            if rc != 0:
+                die(f"ffmpeg failed with code {rc}")
+        else:
+            ff_cmd = build_ffmpeg_command(
+                converted, args.audio, args.logo, filter_complex,
+                args.seconds_per_image, args.output, audio_index,
+                encoder=encoder_choice, bitrate=args.bitrate, crf=None if args.bitrate else args.crf, threads=args.threads
+            )
+
+            print("Running ffmpeg (truncated):")
+            print(" ".join(ff_cmd[:10]) + " ... " + " ".join(ff_cmd[-10:]))
+
+            rc = run_ffmpeg_stream(ff_cmd)
+            if rc != 0:
+                die(f"ffmpeg failed with code {rc}")
 
         print("Done:", args.output)
         print(f"Audio length: {audio_duration:.2f}s, images used: {len(converted)}, resolution: {args.width}x{args.height}")
