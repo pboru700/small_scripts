@@ -94,13 +94,35 @@ def build_drawtext_options(text: str, size: int, fontfile: str, y_pos: float):
 def ffmpeg_wave_color(base_color: str) -> str:
     """Return opaque waveform color derived from hex base color (ignore alpha)."""
     c = (base_color or '#ffffff').strip()
-    # drawbox/drawtext style often uses "#RRGGBB@A"; waveform should ignore alpha.
     if '@' in c:
         c = c.split('@', 1)[0].strip()
     if c.startswith('#') and len(c) == 7:
         return '0x' + c[1:]
-    # Accept already in 0xRRGGBB or named color
     return c
+
+
+def slides_needed_for_audio(audio_duration: float, seconds_per_image: float, fade_duration: float) -> int:
+    """
+    Number of image inputs needed so the xfade chain lasts at least audio_duration.
+
+    Total duration for n slides:
+        D + (n - 1) * (D - T)
+    where:
+        D = seconds_per_image
+        T = fade_duration
+    """
+    if seconds_per_image <= 0:
+        return 1
+
+    step = seconds_per_image - fade_duration
+    if step <= 0:
+        return max(1, int(ceil(audio_duration / seconds_per_image)))
+
+    if audio_duration <= seconds_per_image:
+        return 1
+
+    n = 1 + int(ceil((audio_duration - seconds_per_image) / step))
+    return max(1, n)
 
 
 def slideshow_duration(num_items: int, seconds_per_image: float, transition_dur: float) -> float:
@@ -127,12 +149,11 @@ def build_slideshow_only_filter_complex(
     step = seconds_per_image - transition_dur
     fc_parts = []
 
-    target_ar_expr = f"{width}/{height}"  # For readability
+    target_ar_expr = f"{width}/{height}"
     for i in range(len(converted_inputs)):
         scale_expr = (
             f"scale='if(gte(iw/ih,{target_ar_expr}),{width},-1)':'if(gte(iw/ih,{target_ar_expr}),-1,{height})'"
         )
-        # Keep intermediates in yuva420p (or rgba) so overlay ops are predictable.
         pix = "rgba" if force_rgba else "yuva420p"
         fc_parts.append(
             f"[{i}:v]format={pix},setsar=1,{scale_expr},trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[fg{i}]"
@@ -182,7 +203,6 @@ def build_overlay_filter_complex(
     fc_parts = []
     slide_in = f"[{slide_label}]"
 
-    # Bar + optional text
     if bar_h > 0:
         if text:
             drawtext_opts = build_drawtext_options(text, text_size, fontfile, drawtext_y)
@@ -196,7 +216,6 @@ def build_overlay_filter_complex(
     else:
         fc_parts.append(f"{slide_in}copy[slide_bar]")
 
-    # Waveform
     wave_color = ffmpeg_wave_color(bar_color)
     gen_wave_w = max(2, int(width * max(0.05, min(wave_scale, 1.0))))
     gen_wave_h = wave_h * 2 if wave_direction in ("top", "bottom") else wave_h
@@ -204,6 +223,7 @@ def build_overlay_filter_complex(
     fc_parts.append(
         f"[{audio_index}:a]showwaves=s={gen_wave_w}x{gen_wave_h}:mode=cline:colors={wave_color},format={wave_fmt}[wave_raw]"
     )
+
     if gen_wave_w != width:
         fc_parts.append(f"[wave_raw]scale={width}:{gen_wave_h}:flags=bilinear[wave_scaled_w]")
         wave_current = "wave_scaled_w"
@@ -229,7 +249,6 @@ def build_overlay_filter_complex(
     fc_parts.append(f"[slide_bar][wave]overlay=x=(W-w)/2:y={overlay_y:.2f}:format=auto[mid]")
     fc_parts.append("[mid]setsar=1[mid_fixed]")
 
-    # Logo
     if logo_file:
         logo_fmt = "rgba" if force_rgba else "yuva420p"
         fc_parts.append(f"[{logo_index}:v]format={logo_fmt},setsar=1,scale=105:105[logo_scaled]")
@@ -271,18 +290,37 @@ def convert_images_to_jpeg(src_list, tmpdir, quality=2):
     return converted
 
 
-def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_image, transition_dur,
-                          width, height, wave_h, bar_h, bar_color, text, text_size, fontfile,
-                          xfade_name, overlay_y, drawbox_y, drawtext_y, logo_file,
-                          blur_strength: int, wave_scale: float, force_rgba: bool,
-                          wave_direction: str, wave_round: float):
+def build_filter_complex(
+    converted_inputs,
+    audio_index,
+    logo_index,
+    seconds_per_image,
+    transition_dur,
+    width,
+    height,
+    wave_h,
+    bar_h,
+    bar_color,
+    text,
+    text_size,
+    fontfile,
+    xfade_name,
+    overlay_y,
+    drawbox_y,
+    drawtext_y,
+    logo_file,
+    blur_strength: int,
+    wave_scale: float,
+    force_rgba: bool,
+    wave_direction: str,
+    wave_round: float,
+):
     step = seconds_per_image - transition_dur
     fc_parts = []
 
-    target_ar_expr = f"{width}/{height}"  # For readability
+    target_ar_expr = f"{width}/{height}"
 
     for i in range(len(converted_inputs)):
-        # Foreground: contain scaling + optional upscale so one dimension matches target.
         scale_expr = (
             f"scale='if(gte(iw/ih,{target_ar_expr}),{width},-1)':'if(gte(iw/ih,{target_ar_expr}),-1,{height})'"
         )
@@ -290,16 +328,12 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
         fc_parts.append(
             f"[{i}:v]format={fg_format},setsar=1,{scale_expr},trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[fg{i}]"
         )
-        # Background: stretch + adjustable blur (lower blur_strength improves speed)
         bg_format = "rgba" if force_rgba else "yuva420p"
         fc_parts.append(
             f"[{i}:v]format={bg_format},setsar=1,scale={width}:{height},boxblur={blur_strength}:1,trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[bg{i}]"
         )
-        # Overlay fg centered on blurred bg
-        # Overlay; if alpha path not forced we stay in yuv420p to avoid RGBA conversions
         fc_parts.append(f"[bg{i}][fg{i}]overlay=x=(W-w)/2:y=(H-h)/2,format=yuva420p[v{i}]")
 
-    # Build slideshow with xfade transitions
     if len(converted_inputs) == 1:
         fc_parts.append("[v0]format=yuva420p[slide]")
     else:
@@ -313,7 +347,6 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
         last = len(converted_inputs) - 1
         fc_parts.append(f"[xf{last}]format=yuva420p[slide]")
 
-    # Bar + optional text
     if bar_h > 0:
         if text:
             drawtext_opts = build_drawtext_options(text, text_size, fontfile, drawtext_y)
@@ -327,26 +360,24 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
     else:
         fc_parts.append("[slide]copy[slide_bar]")
 
-    # Waveform generation with directional options.
-    # wave_direction: 'both' (default cline centered), 'top', 'bottom'.
     wave_color = ffmpeg_wave_color(bar_color)
     gen_wave_w = max(2, int(width * max(0.05, min(wave_scale, 1.0))))
-    # If we want only top or bottom, generate at double height then crop half to keep full amplitude feel.
     if wave_direction in ("top", "bottom"):
         gen_wave_h = wave_h * 2
     else:
         gen_wave_h = wave_h
+
     wave_fmt = "yuva420p" if force_rgba else "yuva420p"
     fc_parts.append(
         f"[{audio_index}:a]showwaves=s={gen_wave_w}x{gen_wave_h}:mode=cline:colors={wave_color},format={wave_fmt}[wave_raw]"
     )
-    # Horizontal upscale if reduced generation width
+
     if gen_wave_w != width:
         fc_parts.append(f"[wave_raw]scale={width}:{gen_wave_h}:flags=bilinear[wave_scaled_w]")
         wave_current = "wave_scaled_w"
     else:
         wave_current = "wave_raw"
-    # Crop for directional single-sided waveform -> produce [wave_base]
+
     if wave_direction == "top":
         fc_parts.append(f"[{wave_current}]crop=w={width}:h={wave_h}:x=0:y=0[wave_base]")
     elif wave_direction == "bottom":
@@ -357,50 +388,47 @@ def build_filter_complex(converted_inputs, audio_index, logo_index, seconds_per_
         else:
             fc_parts.append(f"[{wave_current}]copy[wave_base]")
 
-    # Optional rounding (soften edges) using gaussian blur; small sigma (e.g. 1.0) gives subtle rounding.
     if wave_round and wave_round > 0:
-        # Limit sigma to reasonable range to avoid over-blur
         sigma = min(10.0, max(0.1, wave_round))
         fc_parts.append(f"[wave_base]gblur=sigma={sigma}:steps=1[wave]")
     else:
         fc_parts.append("[wave_base]copy[wave]")
 
-    fc_parts.append(
-        f"[slide_bar][wave]overlay=x=(W-w)/2:y={overlay_y:.2f}:format=auto[mid]"
-    )
+    fc_parts.append(f"[slide_bar][wave]overlay=x=(W-w)/2:y={overlay_y:.2f}:format=auto[mid]")
     fc_parts.append("[mid]setsar=1[mid_fixed]")
 
-    # Logo
     if logo_file:
         logo_fmt = "rgba" if force_rgba else "yuva420p"
-        fc_parts.append(
-            f"[{logo_index}:v]format={logo_fmt},setsar=1,scale=105:105[logo_scaled]"
-        )
-        fc_parts.append(
-            "[mid_fixed][logo_scaled]overlay=x=10:y=H-h-10:format=auto[outv]"
-        )
+        fc_parts.append(f"[{logo_index}:v]format={logo_fmt},setsar=1,scale=105:105[logo_scaled]")
+        fc_parts.append("[mid_fixed][logo_scaled]overlay=x=10:y=H-h-10:format=auto[outv]")
     else:
         fc_parts.append("[mid_fixed]copy[outv]")
 
     return ";".join(fc_parts)
 
-def build_ffmpeg_command(converted_inputs, audio_file, logo_file, filter_complex,
-                          seconds_per_image, output_file, audio_index,
-                          encoder: str, bitrate: Optional[str], crf: Optional[int], threads: Optional[int]):
+
+def build_ffmpeg_command(
+    converted_inputs,
+    audio_file,
+    logo_file,
+    filter_complex,
+    seconds_per_image,
+    output_file,
+    audio_index,
+    encoder: str,
+    bitrate: Optional[str],
+    crf: Optional[int],
+    threads: Optional[int],
+):
     ff_args = ["ffmpeg", "-y"]
-    # inputs: one looping image per converted input
     for img in converted_inputs:
         ff_args += ["-loop", "1", "-t", f"{seconds_per_image:.6f}", "-i", img]
-    # audio input
     ff_args += ["-i", audio_file]
-    # optional logo input
     if logo_file:
         ff_args += ["-i", logo_file]
 
-    # filtergraph and mapping then encoder options
     ff_args += ["-filter_complex", filter_complex, "-map", "[outv]", "-map", f"{audio_index}:a"]
 
-    # Video encoding strategy
     if encoder == "x264":
         ff_args += ["-c:v", "libx264"]
         if crf is not None:
@@ -408,21 +436,18 @@ def build_ffmpeg_command(converted_inputs, audio_file, logo_file, filter_complex
         if bitrate:
             ff_args += ["-b:v", bitrate]
     elif encoder == "vt_h264":
-        # macOS VideoToolbox H.264
         ff_args += ["-c:v", "h264_videotoolbox"]
         if bitrate:
             ff_args += ["-b:v", bitrate]
         else:
-            # Use quality scale (lower is better); map CRF-like number roughly
             if crf is not None:
-                q = min(100, max(0, 35 + (crf - 18) * 3))  # heuristic mapping
+                q = min(100, max(0, 35 + (crf - 18) * 3))
                 ff_args += ["-q:v", str(q)]
     elif encoder == "vt_hevc":
         ff_args += ["-c:v", "hevc_videotoolbox"]
         if bitrate:
             ff_args += ["-b:v", bitrate]
     else:
-        # Fallback
         ff_args += ["-c:v", "libx264", "-crf", str(crf or 18), "-preset", "veryfast"]
 
     if threads and encoder == "x264":
@@ -445,7 +470,6 @@ def parse_args():
     p.add_argument("--bar-height", type=int, default=120, help="Height of bottom bar")
     p.add_argument("--bar-color", default="#000000", help="Bottom bar base color (hex, e.g. #000000)")
     p.add_argument("--bar-alpha", type=float, default=0.7, help="Bottom bar alpha (0.0 - 1.0)")
-    # Legacy combined color flag (hex@alpha). If provided, overrides bar-color/bar-alpha.
     p.add_argument("--color", help="(Deprecated) Combined bar color hex@alpha, e.g. #000000@0.7")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
     p.add_argument("--text-size", type=int, default=42, help="Font size for bottom bar text")
@@ -460,7 +484,7 @@ def parse_args():
     p.add_argument("--blur", type=int, default=10, help="Background blur strength (boxblur radius). Lower improves speed.")
     p.add_argument("--wave-scale", type=float, default=1.0, help="Horizontal scale factor (0.1-1.0) to generate waveform at reduced width for performance, then upscale.")
     p.add_argument("--force-rgba", action="store_true", help="Force RGBA intermediate pixel format (may slow down; use only if transparency processing explicitly needed).")
-    p.add_argument("--wave-direction", default="both", choices=["both","top","bottom"], help="Waveform style: both (centered), top (single-sided), bottom (single-sided).")
+    p.add_argument("--wave-direction", default="both", choices=["both", "top", "bottom"], help="Waveform style: both (centered), top (single-sided), bottom (single-sided).")
     p.add_argument("--wave-round", type=float, default=0.0, help="Apply slight gaussian blur (sigma) to waveform to produce rounded/antialiased ends (0 disables).")
     p.add_argument("--max-inputs-per-pass", type=int, default=30, help="Max number of image inputs per ffmpeg pass. Larger audio durations may require chunking to avoid FFmpeg resource exhaustion.")
     return p.parse_args()
@@ -488,24 +512,25 @@ def main():
     except Exception as e:
         die(f"Could not determine audio duration: {e}")
 
-    needed = int(ceil(audio_duration / args.seconds_per_image))
+    # Adjust fade first
+    fade_dur = args.fade_duration
+    if fade_dur >= args.seconds_per_image:
+        fade_dur = args.seconds_per_image / 2.0
+        print(f"Warning: fade-duration >= seconds-per-image; reduced to {fade_dur}")
+
+    # Compute how many images are needed for the full xfade chain
+    needed = slides_needed_for_audio(audio_duration, args.seconds_per_image, fade_dur)
     needed = max(1, needed)
     chosen = [images[i % len(images)] for i in range(needed)]
 
     tmpdir = tempfile.mkdtemp(prefix="wave_jpeg_")
     try:
         converted = convert_images_to_jpeg(chosen, tmpdir, quality=2)
-        # Adjust fade if too large
-        fade_dur = args.fade_duration
-        if fade_dur >= args.seconds_per_image:
-            fade_dur = args.seconds_per_image / 2.0
-            print(f"Warning: fade-duration >= seconds-per-image; reduced to {fade_dur}")
 
         drawbox_y = args.height - args.bar_height
         drawtext_y = drawbox_y + (args.bar_height - args.text_size) / 2.0
         overlay_y = (args.height - args.wave_height) / 2.0
 
-        # If user provided --wave-y, override the computed overlay_y
         if args.wave_y is not None:
             overlay_y = float(args.wave_y)
 
@@ -513,7 +538,6 @@ def main():
         logo_index = audio_index + 1 if args.logo else None
 
         # Compose bar color with alpha for drawbox, but waveform uses opaque base color.
-        # Handle deprecated --color flag if present.
         if getattr(args, 'color', None):
             legacy = args.color.strip()
             if '@' in legacy:
@@ -526,8 +550,8 @@ def main():
                 except ValueError:
                     print("Warning: invalid alpha in --color; falling back to provided --bar-alpha.")
             else:
-                # No alpha specified; keep existing bar-alpha
                 args.bar_color = legacy
+
         bar_color = f"{args.bar_color}@{args.bar_alpha:.3f}" if args.bar_color else f"#000000@{args.bar_alpha:.3f}"
 
         filter_complex = build_filter_complex(
@@ -539,7 +563,6 @@ def main():
             wave_direction=args.wave_direction, wave_round=args.wave_round
         )
 
-        # Determine encoder auto mode
         encoder_choice = args.encoder
         if encoder_choice == "auto":
             encoder_choice = "vt_h264" if sys.platform == "darwin" else "x264"
@@ -568,7 +591,6 @@ def main():
                 for img in seg_inputs:
                     seg_cmd += ["-loop", "1", "-t", f"{args.seconds_per_image:.6f}", "-i", img]
                 seg_cmd += ["-filter_complex", seg_filter, "-map", "[slide]", "-an"]
-                # Intermediate encode: keep it simple and fast.
                 seg_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast"]
                 if args.threads:
                     seg_cmd += ["-threads", str(args.threads)]
@@ -580,7 +602,6 @@ def main():
                     die(f"ffmpeg failed while rendering segment {si} (code {rc})")
                 segment_paths.append(seg_out)
 
-            # Final pass: join segments with xfade, then apply bar/wave/logo with audio.
             final_cmd = ["ffmpeg", "-y"]
             for seg in segment_paths:
                 final_cmd += ["-i", seg]
@@ -638,7 +659,6 @@ def main():
             filter_complex2 = ";".join(fc_parts)
             final_cmd += ["-filter_complex", filter_complex2, "-map", "[outv]", "-map", f"{audio_index}:a"]
 
-            # Use requested encoder settings for final output
             if encoder_choice == "x264":
                 final_cmd += ["-c:v", "libx264"]
                 if args.bitrate:
