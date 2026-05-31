@@ -19,7 +19,7 @@ Usage example:
             --width 1920 --height 1080 \
             --seconds-per-image 10 \
             --fade-duration 0.5 \
-            --bar-color "#000000" \
+            --bar-color "#24d0b8" \
             --bar-alpha 0.7 \
             --text "Sample Title" \
             --text-size 42 \
@@ -83,7 +83,7 @@ def build_drawtext_options(text: str, size: int, fontfile: str, y_pos: float):
         escaped_font = fontfile.replace("'", "\\'")
         parts.append(f"fontfile='{escaped_font}'")
     parts.append(f"text='{escape_drawtext_text(text)}'")
-    parts.append("fontcolor=#f5ba2c")
+    parts.append("fontcolor=#ffb400")
     parts.append(f"fontsize={int(size)}")
     parts.append("x=(w-text_w)/2")
     parts.append(f"y={y_pos:.2f}")
@@ -468,7 +468,7 @@ def parse_args():
     p.add_argument("--fade-duration", type=float, default=1.0, help="Crossfade transition duration in seconds")
     p.add_argument("--wave-height", type=int, default=240, help="Height of waveform visualization in pixels")
     p.add_argument("--bar-height", type=int, default=120, help="Height of bottom bar")
-    p.add_argument("--bar-color", default="#000000", help="Bottom bar base color (hex, e.g. #000000)")
+    p.add_argument("--bar-color", default="#24d0b8", help="Bottom bar base color (hex, e.g. #000000)")
     p.add_argument("--bar-alpha", type=float, default=0.7, help="Bottom bar alpha (0.0 - 1.0)")
     p.add_argument("--color", help="(Deprecated) Combined bar color hex@alpha, e.g. #000000@0.7")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
