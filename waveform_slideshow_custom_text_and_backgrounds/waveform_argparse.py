@@ -123,45 +123,50 @@ def slideshow_duration(num_items: int, seconds_per_image: float, transition_dur:
 
 
 def build_slideshow_only_filter_complex(
-    converted_inputs,
+    fg_inputs,
+    bg_offset: int,
     seconds_per_image: float,
     transition_dur: float,
     width: int,
     height: int,
     xfade_name: str,
-    blur_strength: int,
     force_rgba: bool,
     out_label: str = "slide",
 ):
-    """Build filtergraph that outputs a slideshow video only (no bar/logo)."""
+    """Build filtergraph that outputs a slideshow video only (no bar/logo).
+
+    bg inputs start at index bg_offset and are pre-rendered at target dimensions,
+    so no scale or boxblur is needed in the filtergraph.
+    """
     step = seconds_per_image - transition_dur
     fc_parts = []
     pix = "rgba" if force_rgba else "yuva420p"
     target_ar_expr = f"{width}/{height}"
 
-    for i in range(len(converted_inputs)):
+    for i in range(len(fg_inputs)):
         scale_expr = (
             f"scale='if(gte(iw/ih,{target_ar_expr}),{width},-1)':'if(gte(iw/ih,{target_ar_expr}),-1,{height})'"
         )
         fc_parts.append(
             f"[{i}:v]format={pix},setsar=1,{scale_expr},trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[fg{i}]"
         )
+        # bg is pre-blurred and pre-scaled; just set timing
         fc_parts.append(
-            f"[{i}:v]format={pix},setsar=1,scale={width}:{height},boxblur={blur_strength}:1,trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[bg{i}]"
+            f"[{bg_offset + i}:v]format=yuv420p,setsar=1,trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[bg{i}]"
         )
         fc_parts.append(f"[bg{i}][fg{i}]overlay=x=(W-w)/2:y=(H-h)/2,format=yuv420p[v{i}]")
 
-    if len(converted_inputs) == 1:
+    if len(fg_inputs) == 1:
         fc_parts.append(f"[v0]format=yuv420p[{out_label}]")
     else:
-        for k in range(len(converted_inputs) - 1):
+        for k in range(len(fg_inputs) - 1):
             in1 = "[v0]" if k == 0 else f"[xf{k}]"
             in2 = f"[v{k+1}]"
             offset = step * (k + 1)
             fc_parts.append(
                 f"{in1}{in2}xfade=transition={xfade_name}:duration={transition_dur:.6f}:offset={offset:.6f},format=yuv420p[xf{k+1}]"
             )
-        last = len(converted_inputs) - 1
+        last = len(fg_inputs) - 1
         fc_parts.append(f"[xf{last}]format=yuv420p[{out_label}]")
 
     return ";".join(fc_parts)
@@ -210,7 +215,8 @@ def build_overlay_filter_complex(
 
 
 def build_filter_complex(
-    converted_inputs,
+    fg_inputs,
+    bg_offset,
     logo_index,
     seconds_per_image,
     transition_dur,
@@ -225,12 +231,11 @@ def build_filter_complex(
     drawbox_y,
     drawtext_y,
     logo_file,
-    blur_strength: int,
     force_rgba: bool,
 ):
     slide_fc = build_slideshow_only_filter_complex(
-        converted_inputs, seconds_per_image, transition_dur, width, height,
-        xfade_name, blur_strength, force_rgba, out_label="slide",
+        fg_inputs, bg_offset, seconds_per_image, transition_dur, width, height,
+        xfade_name, force_rgba, out_label="slide",
     )
     overlay_fc = build_overlay_filter_complex(
         "slide", logo_index, width, height, bar_h, bar_color, text, text_size,
@@ -240,7 +245,8 @@ def build_filter_complex(
 
 
 def build_ffmpeg_command(
-    converted_inputs,
+    fg_inputs,
+    bg_inputs,
     audio_file,
     logo_file,
     filter_complex,
@@ -253,7 +259,9 @@ def build_ffmpeg_command(
     threads: Optional[int],
 ):
     ff_args = ["ffmpeg", "-y"]
-    for img in converted_inputs:
+    for img in fg_inputs:
+        ff_args += ["-loop", "1", "-t", f"{seconds_per_image:.6f}", "-i", img]
+    for img in bg_inputs:
         ff_args += ["-loop", "1", "-t", f"{seconds_per_image:.6f}", "-i", img]
     ff_args += ["-i", audio_file]
     if logo_file:
@@ -301,21 +309,38 @@ def run_ffmpeg_stream(cmd):
     return proc.returncode
 
 
-def _convert_single_image(src: str, outname: str, quality: int):
-    cmd = ["ffmpeg", "-y", "-i", src, "-frames:v", "1", "-q:v", str(quality), outname]
+def _render_segment(cmd):
     res = subprocess.run(cmd, capture_output=True, text=True)
     return res.returncode, res.stderr.strip()
 
 
-def convert_images_to_jpeg(src_list, tmpdir, quality=2):
-    # Deduplicate while preserving order so repeated images share one converted file.
+def _convert_image_pair(src: str, fg_out: str, bg_out: str, width: int, height: int, blur: int, quality: int):
+    """Convert one source image into a fg JPEG and a pre-blurred/scaled bg JPEG."""
+    cmd_fg = ["ffmpeg", "-y", "-i", src, "-frames:v", "1", "-q:v", str(quality), fg_out]
+    res = subprocess.run(cmd_fg, capture_output=True, text=True)
+    if res.returncode != 0:
+        return res.returncode, res.stderr.strip()
+    cmd_bg = ["ffmpeg", "-y", "-i", src, "-frames:v", "1",
+              "-vf", f"scale={width}:{height},boxblur={blur}:1",
+              "-q:v", str(quality), bg_out]
+    res = subprocess.run(cmd_bg, capture_output=True, text=True)
+    return res.returncode, res.stderr.strip()
+
+
+def convert_images_to_jpeg(src_list, tmpdir, width: int, height: int, blur: int, quality=2):
+    """Convert images to JPEG pairs (fg + pre-blurred bg) in parallel.
+
+    Returns (fg_list, bg_list) parallel to src_list.
+    Duplicate source paths share one converted pair.
+    """
     unique_srcs = list(dict.fromkeys(src_list))
-    outname_map = {src: os.path.join(tmpdir, f"img_{i:04d}.jpg") for i, src in enumerate(unique_srcs)}
+    fg_map = {src: os.path.join(tmpdir, f"fg_{i:04d}.jpg") for i, src in enumerate(unique_srcs)}
+    bg_map = {src: os.path.join(tmpdir, f"bg_{i:04d}.jpg") for i, src in enumerate(unique_srcs)}
 
     workers = min(len(unique_srcs), os.cpu_count() or 4)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_convert_single_image, src, outname_map[src], quality): src
+            executor.submit(_convert_image_pair, src, fg_map[src], bg_map[src], width, height, blur, quality): src
             for src in unique_srcs
         }
         for future in as_completed(futures):
@@ -324,7 +349,7 @@ def convert_images_to_jpeg(src_list, tmpdir, quality=2):
             if rc != 0:
                 die(f"Image conversion failed for {src}: {stderr}")
 
-    return [outname_map[src] for src in src_list]
+    return [fg_map[src] for src in src_list], [bg_map[src] for src in src_list]
 
 
 def parse_args():
@@ -349,7 +374,7 @@ def parse_args():
     p.add_argument("--bitrate", help="Target video bitrate (e.g. 6M). If set, used instead of CRF for chosen encoder where applicable.")
     p.add_argument("--crf", type=int, default=18, help="CRF value for x264 (quality). Ignored if --bitrate provided or hardware encoder without CRF.")
     p.add_argument("--threads", type=int, help="Threads for libx264 encoding (ignored for VideoToolbox).")
-    p.add_argument("--blur", type=int, default=10, help="Background blur strength (boxblur radius). Lower improves speed.")
+    p.add_argument("--blur", type=int, default=10, help="Background blur strength (boxblur radius). Applied once during preprocessing.")
     p.add_argument("--force-rgba", action="store_true", help="Force RGBA intermediate pixel format (may slow down; use only if transparency processing explicitly needed).")
     p.add_argument("--max-inputs-per-pass", type=int, default=30, help="Max number of image inputs per ffmpeg pass. Larger audio durations may require chunking to avoid FFmpeg resource exhaustion.")
     return p.parse_args()
@@ -387,12 +412,16 @@ def main():
 
     tmpdir = tempfile.mkdtemp(prefix="wave_jpeg_")
     try:
-        converted = convert_images_to_jpeg(chosen, tmpdir, quality=2)
+        fg_converted, bg_converted = convert_images_to_jpeg(
+            chosen, tmpdir, width=args.width, height=args.height, blur=args.blur, quality=2,
+        )
 
         drawbox_y = int(args.height - args.bar_height)
         drawtext_y = drawbox_y + (args.bar_height - args.text_size) / 2.0
 
-        audio_index = len(converted)
+        # fg inputs: 0..N-1, bg inputs: N..2N-1, audio: 2N, logo: 2N+1
+        bg_offset = len(fg_converted)
+        audio_index = bg_offset + len(bg_converted)
         logo_index = audio_index + 1 if args.logo else None
 
         if args.color:
@@ -412,51 +441,66 @@ def main():
         bar_color = f"{args.bar_color}@{args.bar_alpha:.3f}" if args.bar_color else f"#000000@{args.bar_alpha:.3f}"
 
         filter_complex = build_filter_complex(
-            converted, logo_index, args.seconds_per_image, fade_dur,
+            fg_converted, bg_offset, logo_index, args.seconds_per_image, fade_dur,
             args.width, args.height, args.bar_height, bar_color,
             args.text, args.text_size, args.font, args.fade_name,
-            drawbox_y, drawtext_y, args.logo,
-            blur_strength=args.blur, force_rgba=args.force_rgba,
+            drawbox_y, drawtext_y, args.logo, force_rgba=args.force_rgba,
         )
 
         encoder_choice = args.encoder
         if encoder_choice == "auto":
             encoder_choice = "vt_h264" if sys.platform == "darwin" else "x264"
 
-        if args.max_inputs_per_pass and len(converted) > args.max_inputs_per_pass:
+        if args.max_inputs_per_pass and len(fg_converted) > args.max_inputs_per_pass:
             chunk = max(2, args.max_inputs_per_pass)
-            print(f"Large slideshow ({len(converted)} images). Rendering in chunks of {chunk} to avoid ffmpeg resource exhaustion...")
+            print(f"Large slideshow ({len(fg_converted)} images). Rendering in chunks of {chunk} to avoid ffmpeg resource exhaustion...")
 
-            segments = [converted[i:i + chunk] for i in range(0, len(converted), chunk)]
-            segment_paths = []
-            for si, seg_inputs in enumerate(segments):
+            fg_segments = [fg_converted[i:i + chunk] for i in range(0, len(fg_converted), chunk)]
+            bg_segments = [bg_converted[i:i + chunk] for i in range(0, len(bg_converted), chunk)]
+
+            n_workers = min(len(fg_segments), max(1, (os.cpu_count() or 2) // 2))
+            # Divide cores evenly so parallel ffmpeg processes don't thrash each other.
+            seg_threads = args.threads or max(1, (os.cpu_count() or 1) // n_workers)
+
+            # Build all segment commands before submitting so n_workers/seg_threads are fixed.
+            segment_tasks = []
+            for si, (seg_fg, seg_bg) in enumerate(zip(fg_segments, bg_segments)):
                 seg_out = os.path.join(tmpdir, f"segment_{si:03d}.mp4")
                 seg_filter = build_slideshow_only_filter_complex(
-                    seg_inputs,
+                    seg_fg,
+                    bg_offset=len(seg_fg),
                     seconds_per_image=args.seconds_per_image,
                     transition_dur=fade_dur,
                     width=args.width,
                     height=args.height,
                     xfade_name=args.fade_name,
-                    blur_strength=args.blur,
                     force_rgba=args.force_rgba,
                     out_label="slide",
                 )
-
                 seg_cmd = ["ffmpeg", "-y"]
-                for img in seg_inputs:
+                for img in seg_fg:
+                    seg_cmd += ["-loop", "1", "-t", f"{args.seconds_per_image:.6f}", "-i", img]
+                for img in seg_bg:
                     seg_cmd += ["-loop", "1", "-t", f"{args.seconds_per_image:.6f}", "-i", img]
                 seg_cmd += ["-filter_complex", seg_filter, "-map", "[slide]", "-an"]
-                seg_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast"]
-                if args.threads:
-                    seg_cmd += ["-threads", str(args.threads)]
+                seg_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+                            "-threads", str(seg_threads)]
                 seg_cmd += ["-pix_fmt", "yuv420p", seg_out]
+                segment_tasks.append((si, seg_cmd, seg_out))
 
-                print(f"Rendering segment {si + 1}/{len(segments)}...")
-                rc = run_ffmpeg_stream(seg_cmd)
-                if rc != 0:
-                    die(f"ffmpeg failed while rendering segment {si} (code {rc})")
-                segment_paths.append(seg_out)
+            print(f"Rendering {len(segment_tasks)} segments with {n_workers} parallel workers "
+                  f"({seg_threads} threads each)...")
+            segment_paths = [None] * len(segment_tasks)
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = {executor.submit(_render_segment, cmd): (si, out)
+                           for si, cmd, out in segment_tasks}
+                for future in as_completed(futures):
+                    si, seg_out = futures[future]
+                    rc, stderr = future.result()
+                    if rc != 0:
+                        die(f"ffmpeg failed while rendering segment {si} (code {rc}):\n{stderr[-500:]}")
+                    print(f"Segment {si + 1}/{len(segment_tasks)} done.")
+                    segment_paths[si] = seg_out
 
             final_cmd = ["ffmpeg", "-y"]
             for seg in segment_paths:
@@ -470,7 +514,7 @@ def main():
             logo_index = audio_index + 1 if args.logo else None
 
             fc_parts = []
-            seg_durs = [slideshow_duration(len(s), args.seconds_per_image, fade_dur) for s in segments]
+            seg_durs = [slideshow_duration(len(s), args.seconds_per_image, fade_dur) for s in fg_segments]
             for i in range(num_segs):
                 fc_parts.append(f"[{i}:v]setpts=PTS-STARTPTS,format=yuv420p[sv{i}]")
 
@@ -537,9 +581,9 @@ def main():
                 die(f"ffmpeg failed with code {rc}")
         else:
             ff_cmd = build_ffmpeg_command(
-                converted, args.audio, args.logo, filter_complex,
+                fg_converted, bg_converted, args.audio, args.logo, filter_complex,
                 args.seconds_per_image, args.output, audio_index,
-                encoder=encoder_choice, bitrate=args.bitrate, crf=None if args.bitrate else args.crf, threads=args.threads
+                encoder=encoder_choice, bitrate=args.bitrate, crf=None if args.bitrate else args.crf, threads=args.threads,
             )
 
             print("Running ffmpeg (truncated):")
@@ -550,7 +594,7 @@ def main():
                 die(f"ffmpeg failed with code {rc}")
 
         print("Done:", args.output)
-        print(f"Audio length: {audio_duration:.2f}s, images used: {len(converted)}, resolution: {args.width}x{args.height}")
+        print(f"Audio length: {audio_duration:.2f}s, images used: {len(fg_converted)}, resolution: {args.width}x{args.height}")
     finally:
         try:
             shutil.rmtree(tmpdir)
