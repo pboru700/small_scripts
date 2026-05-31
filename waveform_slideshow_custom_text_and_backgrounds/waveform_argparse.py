@@ -49,6 +49,11 @@ def check_dep(name: str):
         die(f"Required executable '{name}' not found in PATH.")
 
 
+def _has_ffmpeg_encoder(name: str) -> bool:
+    res = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
+    return f" {name} " in res.stdout
+
+
 def gather_images(images_dir: str):
     files = []
     for entry in os.listdir(images_dir):
@@ -141,14 +146,10 @@ def build_slideshow_only_filter_complex(
     step = seconds_per_image - transition_dur
     fc_parts = []
     pix = "rgba" if force_rgba else "yuva420p"
-    target_ar_expr = f"{width}/{height}"
 
     for i in range(len(fg_inputs)):
-        scale_expr = (
-            f"scale='if(gte(iw/ih,{target_ar_expr}),{width},-1)':'if(gte(iw/ih,{target_ar_expr}),-1,{height})'"
-        )
         fc_parts.append(
-            f"[{i}:v]format={pix},setsar=1,{scale_expr},trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[fg{i}]"
+            f"[{i}:v]format={pix},setsar=1,trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[fg{i}]"
         )
         # bg is pre-blurred and pre-scaled; just set timing
         fc_parts.append(
@@ -314,16 +315,25 @@ def _render_segment(cmd):
     return res.returncode, res.stderr.strip()
 
 
+def _available_ram_mb() -> int:
+    """Return available physical RAM in MB via portable POSIX sysconf (Linux + macOS)."""
+    try:
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_AVPHYS_PAGES') // (1024 * 1024)
+    except (AttributeError, ValueError, OSError):
+        return 0
+
+
 def _convert_image_pair(src: str, fg_out: str, bg_out: str, width: int, height: int, blur: int, quality: int):
-    """Convert one source image into a fg JPEG and a pre-blurred/scaled bg JPEG."""
-    cmd_fg = ["ffmpeg", "-y", "-i", src, "-frames:v", "1", "-q:v", str(quality), fg_out]
-    res = subprocess.run(cmd_fg, capture_output=True, text=True)
-    if res.returncode != 0:
-        return res.returncode, res.stderr.strip()
-    cmd_bg = ["ffmpeg", "-y", "-i", src, "-frames:v", "1",
-              "-vf", f"scale={width}:{height},boxblur={blur}:1",
-              "-q:v", str(quality), bg_out]
-    res = subprocess.run(cmd_bg, capture_output=True, text=True)
+    """Convert one source image into a fg JPEG (pre-scaled to contain) and a pre-blurred/scaled bg JPEG."""
+    scale_fg = f"scale='if(gte(iw/ih,{width}/{height}),{width},-1)':'if(gte(iw/ih,{width}/{height}),-1,{height})'"
+    cmd = [
+        "ffmpeg", "-y", "-i", src,
+        "-filter_complex",
+        f"[0:v]split=2[a][b];[a]{scale_fg}[fg];[b]scale={width}:{height},boxblur={blur}:1[bg]",
+        "-map", "[fg]", "-frames:v", "1", "-q:v", str(quality), fg_out,
+        "-map", "[bg]", "-frames:v", "1", "-q:v", str(quality), bg_out,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
     return res.returncode, res.stderr.strip()
 
 
@@ -337,7 +347,11 @@ def convert_images_to_jpeg(src_list, tmpdir, width: int, height: int, blur: int,
     fg_map = {src: os.path.join(tmpdir, f"fg_{i:04d}.jpg") for i, src in enumerate(unique_srcs)}
     bg_map = {src: os.path.join(tmpdir, f"bg_{i:04d}.jpg") for i, src in enumerate(unique_srcs)}
 
-    workers = min(len(unique_srcs), os.cpu_count() or 4)
+    # Each worker runs one ffmpeg process for bg (scale+blur): ~200 MB overhead + frame buffers.
+    avail_mb = _available_ram_mb()
+    mem_per_worker_mb = 200 + max(1, width * height * 5 // (1024 * 1024))
+    by_mem = max(1, int(avail_mb * 0.6) // mem_per_worker_mb) if avail_mb else (os.cpu_count() or 4)
+    workers = min(len(unique_srcs), os.cpu_count() or 4, by_mem)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(_convert_image_pair, src, fg_map[src], bg_map[src], width, height, blur, quality): src
@@ -376,7 +390,8 @@ def parse_args():
     p.add_argument("--threads", type=int, help="Threads for libx264 encoding (ignored for VideoToolbox).")
     p.add_argument("--blur", type=int, default=10, help="Background blur strength (boxblur radius). Applied once during preprocessing.")
     p.add_argument("--force-rgba", action="store_true", help="Force RGBA intermediate pixel format (may slow down; use only if transparency processing explicitly needed).")
-    p.add_argument("--max-inputs-per-pass", type=int, default=30, help="Max number of image inputs per ffmpeg pass. Larger audio durations may require chunking to avoid FFmpeg resource exhaustion.")
+    p.add_argument("--max-inputs-per-pass", type=int, default=15, help="Max fg images per ffmpeg pass (bg images double the total; lower to reduce per-process RAM).")
+    p.add_argument("--segment-workers", type=int, default=None, help="Parallel workers for segment rendering. Default: auto-sized to fit in available RAM.")
     return p.parse_args()
 
 
@@ -449,7 +464,10 @@ def main():
 
         encoder_choice = args.encoder
         if encoder_choice == "auto":
-            encoder_choice = "vt_h264" if sys.platform == "darwin" else "x264"
+            if sys.platform == "darwin" and _has_ffmpeg_encoder("h264_videotoolbox"):
+                encoder_choice = "vt_h264"
+            else:
+                encoder_choice = "x264"
 
         if args.max_inputs_per_pass and len(fg_converted) > args.max_inputs_per_pass:
             chunk = max(2, args.max_inputs_per_pass)
@@ -458,7 +476,14 @@ def main():
             fg_segments = [fg_converted[i:i + chunk] for i in range(0, len(fg_converted), chunk)]
             bg_segments = [bg_converted[i:i + chunk] for i in range(0, len(bg_converted), chunk)]
 
-            n_workers = min(len(fg_segments), max(1, (os.cpu_count() or 2) // 2))
+            # Each segment process: ~250 MB ffmpeg overhead + ~15 MB per fg+bg input pair.
+            avail_mb = _available_ram_mb()
+            mem_per_seg_mb = 250 + chunk * 15
+            by_mem = max(1, int(avail_mb * 0.6) // mem_per_seg_mb) if avail_mb else 1
+            by_cpu = max(1, (os.cpu_count() or 2) // 2)
+            n_workers = min(len(fg_segments), by_cpu, by_mem)
+            if args.segment_workers is not None:
+                n_workers = max(1, min(len(fg_segments), args.segment_workers))
             # Divide cores evenly so parallel ffmpeg processes don't thrash each other.
             seg_threads = args.threads or max(1, (os.cpu_count() or 1) // n_workers)
 
@@ -483,8 +508,13 @@ def main():
                 for img in seg_bg:
                     seg_cmd += ["-loop", "1", "-t", f"{args.seconds_per_image:.6f}", "-i", img]
                 seg_cmd += ["-filter_complex", seg_filter, "-map", "[slide]", "-an"]
-                seg_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
-                            "-threads", str(seg_threads)]
+                if encoder_choice == "vt_h264":
+                    seg_cmd += ["-c:v", "h264_videotoolbox", "-b:v", args.bitrate or "8M"]
+                elif encoder_choice == "vt_hevc":
+                    seg_cmd += ["-c:v", "hevc_videotoolbox", "-b:v", args.bitrate or "8M"]
+                else:
+                    seg_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "ultrafast",
+                                "-threads", str(seg_threads)]
                 seg_cmd += ["-pix_fmt", "yuv420p", seg_out]
                 segment_tasks.append((si, seg_cmd, seg_out))
 
