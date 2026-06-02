@@ -376,7 +376,7 @@ def parse_args():
     p.add_argument("--seconds-per-image", type=float, default=20.0, help="Seconds each image remains before transition")
     p.add_argument("--fade-duration", type=float, default=1.0, help="Crossfade transition duration in seconds")
     p.add_argument("--bar-height", type=int, default=120, help="Height of bottom bar")
-    p.add_argument("--bar-color", default="#24d0b8", help="Bottom bar base color (hex, e.g. #000000)")
+    p.add_argument("--bar-color", default="#005459", help="Bottom bar base color (hex, e.g. #000000)")
     p.add_argument("--bar-alpha", type=float, default=0.7, help="Bottom bar alpha (0.0 - 1.0)")
     p.add_argument("--color", help="(Deprecated) Combined bar color hex@alpha, e.g. #000000@0.7")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
