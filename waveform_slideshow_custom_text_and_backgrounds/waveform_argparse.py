@@ -380,7 +380,7 @@ def parse_args():
     p.add_argument("--bar-alpha", type=float, default=0.7, help="Bottom bar alpha (0.0 - 1.0)")
     p.add_argument("--color", help="(Deprecated) Combined bar color hex@alpha, e.g. #000000@0.7")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
-    p.add_argument("--text-size", type=int, default=42, help="Font size for bottom bar text")
+    p.add_argument("--text-size", type=int, default=54, help="Font size for bottom bar text")
     p.add_argument("--font", default="", help="Optional font file path for drawtext")
     p.add_argument("--fade-name", default="fade", help="FFmpeg xfade transition name (e.g. fade, wipeleft, circleopen)")
     p.add_argument("--logo", default="", help="Optional logo image path")
