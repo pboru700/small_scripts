@@ -82,7 +82,7 @@ def escape_drawtext_text(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'").replace("%", "%%")
 
 
-def build_drawtext_options(text: str, size: int, fontfile: str, y_pos: float):
+def build_drawtext_options(text: str, size: int, fontfile: str, y_pos):
     parts = []
     if fontfile:
         escaped_font = fontfile.replace("'", "\\'")
@@ -91,7 +91,7 @@ def build_drawtext_options(text: str, size: int, fontfile: str, y_pos: float):
     parts.append("fontcolor=#ffb000")
     parts.append(f"fontsize={size}")
     parts.append("x=(w-text_w)/2")
-    parts.append(f"y={y_pos:.2f}")
+    parts.append(f"y={y_pos}")
     parts.append("box=0")
     return ":".join(parts)
 
@@ -432,7 +432,7 @@ def main():
         )
 
         drawbox_y = int(args.height - args.bar_height)
-        drawtext_y = drawbox_y + (args.bar_height - args.text_size) / 2.0
+        drawtext_y = f"{drawbox_y}+({args.bar_height}-text_h)/2"
 
         # fg inputs: 0..N-1, bg inputs: N..2N-1, audio: 2N, logo: 2N+1
         bg_offset = len(fg_converted)
