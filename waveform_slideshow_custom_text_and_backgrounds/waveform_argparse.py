@@ -401,9 +401,12 @@ def parse_args():
     p.add_argument("--seconds-per-image", type=float, default=20.0, help="Seconds each image remains before transition")
     p.add_argument("--fade-duration", type=float, default=1.0, help="Crossfade transition duration in seconds")
     p.add_argument("--bar-height", type=int, default=120, help="Height of bottom bar")
-    p.add_argument("--bar-blur", type=int, default=20, help="Blur radius for the bottom bar (boxblur radius)")
-    p.add_argument("--bar-tint", default="#00464a", help="Tint color overlaid on the blurred bar (hex, e.g. #00464a). Empty string disables tint.")
-    p.add_argument("--bar-tint-alpha", type=float, default=0.5, help="Opacity of the bar tint (0.0 - 1.0)")
+    p.add_argument("--bar-style", default="blur", choices=["blur", "solid"], help="Bottom bar style: 'blur' (frosted glass with optional tint) or 'solid' (flat alpha color)")
+    p.add_argument("--bar-color", default="#00464a", help="Bar color for --bar-style solid (hex, e.g. #000000)")
+    p.add_argument("--bar-alpha", type=float, default=0.7, help="Bar opacity for --bar-style solid (0.0 - 1.0)")
+    p.add_argument("--bar-blur", type=int, default=20, help="Blur radius for --bar-style blur (boxblur radius)")
+    p.add_argument("--bar-tint", default="#00464a", help="Tint color overlaid on the blurred bar for --bar-style blur (hex). Empty string disables tint.")
+    p.add_argument("--bar-tint-alpha", type=float, default=0.5, help="Opacity of the bar tint for --bar-style blur (0.0 - 1.0)")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
     p.add_argument("--text-size", type=int, default=54, help="Font size for bottom bar text")
     p.add_argument("--font", default="", help="Optional font file path for drawtext")
@@ -466,7 +469,9 @@ def main():
 
         filter_complex = build_filter_complex(
             fg_converted, bg_offset, logo_index, args.seconds_per_image, fade_dur,
-            args.width, args.height, args.bar_height, args.bar_blur, args.bar_tint, args.bar_tint_alpha,
+            args.width, args.height, args.bar_height,
+            args.bar_style, args.bar_color, args.bar_alpha,
+            args.bar_blur, args.bar_tint, args.bar_tint_alpha,
             args.text, args.text_size, args.font, args.fade_name,
             drawbox_y, drawtext_y, args.logo, force_rgba=args.force_rgba,
         )
@@ -578,6 +583,9 @@ def main():
                     width=args.width,
                     height=args.height,
                     bar_h=args.bar_height,
+                    bar_style=args.bar_style,
+                    bar_color=args.bar_color,
+                    bar_alpha=args.bar_alpha,
                     bar_blur=args.bar_blur,
                     bar_tint=args.bar_tint,
                     bar_tint_alpha=args.bar_tint_alpha,
