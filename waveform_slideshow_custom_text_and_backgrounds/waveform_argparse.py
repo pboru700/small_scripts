@@ -95,6 +95,27 @@ def build_drawtext_options(text: str, size: int, fontfile: str, y_pos):
     return ":".join(parts)
 
 
+def _anim_y_expr(height: int, bar_h: int, drawbox_y: int,
+                 slide_in_delay: float, visible_dur: float, slide_dur: float) -> str:
+    """FFmpeg y-position expression: bar hidden → slides up after slide_in_delay → visible for visible_dur → slides down.
+
+    \, escapes commas so the filter graph parser does not treat them as filter separators.
+    """
+    if slide_dur <= 0:
+        return str(drawbox_y)
+    S = slide_dur
+    D = slide_in_delay
+    V = visible_dur
+    # t0: slide-in starts, t1: fully visible, t2: slide-out starts, t3: fully hidden
+    return (
+        f"if(lt(t\\,{D})\\,{height}\\,"
+        f"if(lt(t\\,{D}+{S})\\,{height}-{bar_h}*(t-{D})/{S}\\,"
+        f"if(lt(t\\,{D}+{S}+{V})\\,{drawbox_y}\\,"
+        f"if(lt(t\\,{D}+{S}+{V}+{S})\\,{drawbox_y}+{bar_h}*(t-{D}-{S}-{V})/{S}\\,"
+        f"{height}))))"
+    )
+
+
 def slides_needed_for_audio(audio_duration: float, seconds_per_image: float, fade_duration: float) -> int:
     """
     Number of image inputs needed so the xfade chain lasts at least audio_duration.
@@ -178,6 +199,9 @@ def build_overlay_filter_complex(
     width: int,
     height: int,
     bar_h: int,
+    bar_style: str,
+    bar_color: str,
+    bar_alpha: float,
     bar_blur: int,
     bar_tint: str,
     bar_tint_alpha: float,
@@ -185,26 +209,40 @@ def build_overlay_filter_complex(
     text_size: int,
     fontfile: str,
     drawbox_y: int,
-    drawtext_y: float,
     logo_file: str,
     force_rgba: bool,
+    slide_in_delay: float = 0.0,
+    visible_dur: float = 0.0,
+    slide_dur: float = 0.0,
 ):
     fc_parts = []
     slide_in = f"[{slide_label}]"
+    bar_y = _anim_y_expr(height, bar_h, drawbox_y, slide_in_delay, visible_dur, slide_dur)
 
     if bar_h > 0:
-        fc_parts.append(f"{slide_in}split=2[base][blursrc]")
-        blur_chain = f"crop=iw:{bar_h}:0:{drawbox_y},boxblur={bar_blur}:5"
-        if bar_tint:
-            blur_chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={bar_tint}@{bar_tint_alpha:.3f}:t=fill"
-        fc_parts.append(f"[blursrc]{blur_chain}[blurredbar]")
-        if text:
-            drawtext_opts = build_drawtext_options(text, text_size, fontfile, drawtext_y)
-            fc_parts.append(
-                f"[base][blurredbar]overlay=x=0:y={drawbox_y},drawtext={drawtext_opts}[slide_bar]"
-            )
+        if bar_style == "solid":
+            solid_color = f"{bar_color}@{bar_alpha:.3f}" if bar_color else f"#000000@{bar_alpha:.3f}"
+            text_y = f"{bar_y}+({bar_h}-text_h)/2"
+            if text:
+                drawtext_opts = build_drawtext_options(text, text_size, fontfile, text_y)
+                fc_parts.append(
+                    f"{slide_in}drawbox=x=0:y={bar_y}:w=iw:h={bar_h}:color={solid_color}:t=fill,drawtext={drawtext_opts}[slide_bar]"
+                )
+            else:
+                fc_parts.append(
+                    f"{slide_in}drawbox=x=0:y={bar_y}:w=iw:h={bar_h}:color={solid_color}:t=fill[slide_bar]"
+                )
         else:
-            fc_parts.append(f"[base][blurredbar]overlay=x=0:y={drawbox_y}[slide_bar]")
+            fc_parts.append(f"{slide_in}split=2[base][blursrc]")
+            blur_chain = f"crop=iw:{bar_h}:0:{drawbox_y},boxblur={bar_blur}:5"
+            if bar_tint:
+                blur_chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={bar_tint}@{bar_tint_alpha:.3f}:t=fill"
+            if text:
+                drawtext_opts = build_drawtext_options(text, text_size, fontfile, "(h-text_h)/2")
+                fc_parts.append(f"[blursrc]{blur_chain},drawtext={drawtext_opts}[blurredbar]")
+            else:
+                fc_parts.append(f"[blursrc]{blur_chain}[blurredbar]")
+            fc_parts.append(f"[base][blurredbar]overlay=x=0:y={bar_y}[slide_bar]")
     else:
         fc_parts.append(f"{slide_in}copy[slide_bar]")
 
@@ -228,6 +266,9 @@ def build_filter_complex(
     width,
     height,
     bar_h,
+    bar_style,
+    bar_color,
+    bar_alpha,
     bar_blur,
     bar_tint,
     bar_tint_alpha,
@@ -236,17 +277,21 @@ def build_filter_complex(
     fontfile,
     xfade_name,
     drawbox_y,
-    drawtext_y,
     logo_file,
     force_rgba: bool,
+    slide_in_delay: float = 0.0,
+    visible_dur: float = 0.0,
+    slide_dur: float = 0.0,
 ):
     slide_fc = build_slideshow_only_filter_complex(
         fg_inputs, bg_offset, seconds_per_image, transition_dur, width, height,
         xfade_name, force_rgba, out_label="slide",
     )
     overlay_fc = build_overlay_filter_complex(
-        "slide", logo_index, width, height, bar_h, bar_blur, bar_tint, bar_tint_alpha,
-        text, text_size, fontfile, drawbox_y, drawtext_y, logo_file, force_rgba,
+        "slide", logo_index, width, height, bar_h, bar_style, bar_color, bar_alpha,
+        bar_blur, bar_tint, bar_tint_alpha, text, text_size, fontfile,
+        drawbox_y, logo_file, force_rgba,
+        slide_in_delay=slide_in_delay, visible_dur=visible_dur, slide_dur=slide_dur,
     )
     return slide_fc + ";" + overlay_fc
 
@@ -382,9 +427,15 @@ def parse_args():
     p.add_argument("--seconds-per-image", type=float, default=20.0, help="Seconds each image remains before transition")
     p.add_argument("--fade-duration", type=float, default=1.0, help="Crossfade transition duration in seconds")
     p.add_argument("--bar-height", type=int, default=120, help="Height of bottom bar")
-    p.add_argument("--bar-blur", type=int, default=20, help="Blur radius for the bottom bar (boxblur radius)")
-    p.add_argument("--bar-tint", default="#00464a", help="Tint color overlaid on the blurred bar (hex, e.g. #00464a). Empty string disables tint.")
-    p.add_argument("--bar-tint-alpha", type=float, default=0.5, help="Opacity of the bar tint (0.0 - 1.0)")
+    p.add_argument("--bar-style", default="blur", choices=["blur", "solid"], help="Bottom bar style: 'blur' (frosted glass with optional tint) or 'solid' (flat alpha color)")
+    p.add_argument("--bar-color", default="#00464a", help="Bar color for --bar-style solid (hex, e.g. #000000)")
+    p.add_argument("--bar-alpha", type=float, default=0.7, help="Bar opacity for --bar-style solid (0.0 - 1.0)")
+    p.add_argument("--bar-blur", type=int, default=20, help="Blur radius for --bar-style blur (boxblur radius)")
+    p.add_argument("--bar-tint", default="#00464a", help="Tint color overlaid on the blurred bar for --bar-style blur (hex). Empty string disables tint.")
+    p.add_argument("--bar-tint-alpha", type=float, default=0.5, help="Opacity of the bar tint for --bar-style blur (0.0 - 1.0)")
+    p.add_argument("--bar-slide-in-delay", type=float, default=3.0, help="Seconds before the bar slides up into view (default: 3)")
+    p.add_argument("--bar-visible-duration", type=float, default=30.0, help="Seconds the bar remains visible before sliding back down (default: 30)")
+    p.add_argument("--bar-slide-duration", type=float, default=1.0, help="Duration of each slide animation in seconds, both in and out (default: 1)")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
     p.add_argument("--text-size", type=int, default=54, help="Font size for bottom bar text")
     p.add_argument("--font", default="", help="Optional font file path for drawtext")
@@ -438,7 +489,6 @@ def main():
         )
 
         drawbox_y = int(args.height - args.bar_height)
-        drawtext_y = f"{drawbox_y}+({args.bar_height}-text_h)/2"
 
         # fg inputs: 0..N-1, bg inputs: N..2N-1, audio: 2N, logo: 2N+1
         bg_offset = len(fg_converted)
@@ -447,9 +497,14 @@ def main():
 
         filter_complex = build_filter_complex(
             fg_converted, bg_offset, logo_index, args.seconds_per_image, fade_dur,
-            args.width, args.height, args.bar_height, args.bar_blur, args.bar_tint, args.bar_tint_alpha,
+            args.width, args.height, args.bar_height,
+            args.bar_style, args.bar_color, args.bar_alpha,
+            args.bar_blur, args.bar_tint, args.bar_tint_alpha,
             args.text, args.text_size, args.font, args.fade_name,
-            drawbox_y, drawtext_y, args.logo, force_rgba=args.force_rgba,
+            drawbox_y, args.logo, force_rgba=args.force_rgba,
+            slide_in_delay=args.bar_slide_in_delay,
+            visible_dur=args.bar_visible_duration,
+            slide_dur=args.bar_slide_duration,
         )
 
         encoder_choice = args.encoder
@@ -559,6 +614,9 @@ def main():
                     width=args.width,
                     height=args.height,
                     bar_h=args.bar_height,
+                    bar_style=args.bar_style,
+                    bar_color=args.bar_color,
+                    bar_alpha=args.bar_alpha,
                     bar_blur=args.bar_blur,
                     bar_tint=args.bar_tint,
                     bar_tint_alpha=args.bar_tint_alpha,
@@ -566,9 +624,11 @@ def main():
                     text_size=args.text_size,
                     fontfile=args.font,
                     drawbox_y=drawbox_y,
-                    drawtext_y=drawtext_y,
                     logo_file=args.logo,
                     force_rgba=args.force_rgba,
+                    slide_in_delay=args.bar_slide_in_delay,
+                    visible_dur=args.bar_visible_duration,
+                    slide_dur=args.bar_slide_duration,
                 )
             )
 
