@@ -178,6 +178,9 @@ def build_overlay_filter_complex(
     width: int,
     height: int,
     bar_h: int,
+    bar_style: str,
+    bar_color: str,
+    bar_alpha: float,
     bar_blur: int,
     bar_tint: str,
     bar_tint_alpha: float,
@@ -193,18 +196,30 @@ def build_overlay_filter_complex(
     slide_in = f"[{slide_label}]"
 
     if bar_h > 0:
-        fc_parts.append(f"{slide_in}split=2[base][blursrc]")
-        blur_chain = f"crop=iw:{bar_h}:0:{drawbox_y},boxblur={bar_blur}:5"
-        if bar_tint:
-            blur_chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={bar_tint}@{bar_tint_alpha:.3f}:t=fill"
-        fc_parts.append(f"[blursrc]{blur_chain}[blurredbar]")
-        if text:
-            drawtext_opts = build_drawtext_options(text, text_size, fontfile, drawtext_y)
-            fc_parts.append(
-                f"[base][blurredbar]overlay=x=0:y={drawbox_y},drawtext={drawtext_opts}[slide_bar]"
-            )
+        if bar_style == "solid":
+            solid_color = f"{bar_color}@{bar_alpha:.3f}" if bar_color else f"#000000@{bar_alpha:.3f}"
+            if text:
+                drawtext_opts = build_drawtext_options(text, text_size, fontfile, drawtext_y)
+                fc_parts.append(
+                    f"{slide_in}drawbox=x=0:y={drawbox_y}:w=iw:h={bar_h}:color={solid_color}:t=fill,drawtext={drawtext_opts}[slide_bar]"
+                )
+            else:
+                fc_parts.append(
+                    f"{slide_in}drawbox=x=0:y={drawbox_y}:w=iw:h={bar_h}:color={solid_color}:t=fill[slide_bar]"
+                )
         else:
-            fc_parts.append(f"[base][blurredbar]overlay=x=0:y={drawbox_y}[slide_bar]")
+            fc_parts.append(f"{slide_in}split=2[base][blursrc]")
+            blur_chain = f"crop=iw:{bar_h}:0:{drawbox_y},boxblur={bar_blur}:5"
+            if bar_tint:
+                blur_chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={bar_tint}@{bar_tint_alpha:.3f}:t=fill"
+            fc_parts.append(f"[blursrc]{blur_chain}[blurredbar]")
+            if text:
+                drawtext_opts = build_drawtext_options(text, text_size, fontfile, drawtext_y)
+                fc_parts.append(
+                    f"[base][blurredbar]overlay=x=0:y={drawbox_y},drawtext={drawtext_opts}[slide_bar]"
+                )
+            else:
+                fc_parts.append(f"[base][blurredbar]overlay=x=0:y={drawbox_y}[slide_bar]")
     else:
         fc_parts.append(f"{slide_in}copy[slide_bar]")
 
@@ -228,6 +243,9 @@ def build_filter_complex(
     width,
     height,
     bar_h,
+    bar_style,
+    bar_color,
+    bar_alpha,
     bar_blur,
     bar_tint,
     bar_tint_alpha,
@@ -245,8 +263,9 @@ def build_filter_complex(
         xfade_name, force_rgba, out_label="slide",
     )
     overlay_fc = build_overlay_filter_complex(
-        "slide", logo_index, width, height, bar_h, bar_blur, bar_tint, bar_tint_alpha,
-        text, text_size, fontfile, drawbox_y, drawtext_y, logo_file, force_rgba,
+        "slide", logo_index, width, height, bar_h, bar_style, bar_color, bar_alpha,
+        bar_blur, bar_tint, bar_tint_alpha, text, text_size, fontfile,
+        drawbox_y, drawtext_y, logo_file, force_rgba,
     )
     return slide_fc + ";" + overlay_fc
 
