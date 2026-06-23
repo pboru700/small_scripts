@@ -6,7 +6,7 @@ Generate a video slideshow from a folder of images and an MP3 audio track with:
  - Each image scaled to "contain" within target while preserving aspect ratio (upscale if smaller, downscale if larger)
  - Blurred stretched background of each image filling full frame
  - Crossfade transitions between images
- - Bottom semi-transparent bar with centered text
+ - Bottom blurred bar with centered text
  - Optional logo overlay
  - Loop images if audio is longer than total image display time
 
@@ -18,8 +18,7 @@ Usage example:
             --width 1920 --height 1080 \
             --seconds-per-image 10 \
             --fade-duration 0.5 \
-            --bar-color "#00464a" \
-            --bar-alpha 0.7 \
+            --bar-blur 20 \
             --text "Sample Title" \
             --text-size 42 \
             --font /Library/Fonts/Arial.ttf \
@@ -179,7 +178,9 @@ def build_overlay_filter_complex(
     width: int,
     height: int,
     bar_h: int,
-    bar_color: str,
+    bar_blur: int,
+    bar_tint: str,
+    bar_tint_alpha: float,
     text: str,
     text_size: int,
     fontfile: str,
@@ -192,15 +193,18 @@ def build_overlay_filter_complex(
     slide_in = f"[{slide_label}]"
 
     if bar_h > 0:
+        fc_parts.append(f"{slide_in}split=2[base][blursrc]")
+        blur_chain = f"crop=iw:{bar_h}:0:{drawbox_y},boxblur={bar_blur}:5"
+        if bar_tint:
+            blur_chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={bar_tint}@{bar_tint_alpha:.3f}:t=fill"
+        fc_parts.append(f"[blursrc]{blur_chain}[blurredbar]")
         if text:
             drawtext_opts = build_drawtext_options(text, text_size, fontfile, drawtext_y)
             fc_parts.append(
-                f"{slide_in}drawbox=x=0:y={drawbox_y}:w=iw:h={bar_h}:color={bar_color}:t=fill,drawtext={drawtext_opts}[slide_bar]"
+                f"[base][blurredbar]overlay=x=0:y={drawbox_y},drawtext={drawtext_opts}[slide_bar]"
             )
         else:
-            fc_parts.append(
-                f"{slide_in}drawbox=x=0:y={drawbox_y}:w=iw:h={bar_h}:color={bar_color}:t=fill[slide_bar]"
-            )
+            fc_parts.append(f"[base][blurredbar]overlay=x=0:y={drawbox_y}[slide_bar]")
     else:
         fc_parts.append(f"{slide_in}copy[slide_bar]")
 
@@ -224,7 +228,9 @@ def build_filter_complex(
     width,
     height,
     bar_h,
-    bar_color,
+    bar_blur,
+    bar_tint,
+    bar_tint_alpha,
     text,
     text_size,
     fontfile,
@@ -239,8 +245,8 @@ def build_filter_complex(
         xfade_name, force_rgba, out_label="slide",
     )
     overlay_fc = build_overlay_filter_complex(
-        "slide", logo_index, width, height, bar_h, bar_color, text, text_size,
-        fontfile, drawbox_y, drawtext_y, logo_file, force_rgba,
+        "slide", logo_index, width, height, bar_h, bar_blur, bar_tint, bar_tint_alpha,
+        text, text_size, fontfile, drawbox_y, drawtext_y, logo_file, force_rgba,
     )
     return slide_fc + ";" + overlay_fc
 
@@ -376,9 +382,9 @@ def parse_args():
     p.add_argument("--seconds-per-image", type=float, default=20.0, help="Seconds each image remains before transition")
     p.add_argument("--fade-duration", type=float, default=1.0, help="Crossfade transition duration in seconds")
     p.add_argument("--bar-height", type=int, default=120, help="Height of bottom bar")
-    p.add_argument("--bar-color", default="#00464a", help="Bottom bar base color (hex, e.g. #000000)")
-    p.add_argument("--bar-alpha", type=float, default=0.7, help="Bottom bar alpha (0.0 - 1.0)")
-    p.add_argument("--color", help="(Deprecated) Combined bar color hex@alpha, e.g. #000000@0.7")
+    p.add_argument("--bar-blur", type=int, default=20, help="Blur radius for the bottom bar (boxblur radius)")
+    p.add_argument("--bar-tint", default="#00464a", help="Tint color overlaid on the blurred bar (hex, e.g. #00464a). Empty string disables tint.")
+    p.add_argument("--bar-tint-alpha", type=float, default=0.5, help="Opacity of the bar tint (0.0 - 1.0)")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
     p.add_argument("--text-size", type=int, default=54, help="Font size for bottom bar text")
     p.add_argument("--font", default="", help="Optional font file path for drawtext")
@@ -439,25 +445,9 @@ def main():
         audio_index = bg_offset + len(bg_converted)
         logo_index = audio_index + 1 if args.logo else None
 
-        if args.color:
-            legacy = args.color.strip()
-            if '@' in legacy:
-                base, alpha = legacy.split('@', 1)
-                try:
-                    alpha_f = float(alpha)
-                    if 0 <= alpha_f <= 1:
-                        args.bar_color = base
-                        args.bar_alpha = alpha_f
-                except ValueError:
-                    print("Warning: invalid alpha in --color; falling back to provided --bar-alpha.")
-            else:
-                args.bar_color = legacy
-
-        bar_color = f"{args.bar_color}@{args.bar_alpha:.3f}" if args.bar_color else f"#000000@{args.bar_alpha:.3f}"
-
         filter_complex = build_filter_complex(
             fg_converted, bg_offset, logo_index, args.seconds_per_image, fade_dur,
-            args.width, args.height, args.bar_height, bar_color,
+            args.width, args.height, args.bar_height, args.bar_blur, args.bar_tint, args.bar_tint_alpha,
             args.text, args.text_size, args.font, args.fade_name,
             drawbox_y, drawtext_y, args.logo, force_rgba=args.force_rgba,
         )
@@ -569,7 +559,9 @@ def main():
                     width=args.width,
                     height=args.height,
                     bar_h=args.bar_height,
-                    bar_color=bar_color,
+                    bar_blur=args.bar_blur,
+                    bar_tint=args.bar_tint,
+                    bar_tint_alpha=args.bar_tint_alpha,
                     text=args.text,
                     text_size=args.text_size,
                     fontfile=args.font,
