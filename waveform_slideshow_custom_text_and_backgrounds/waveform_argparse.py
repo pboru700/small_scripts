@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import ceil
 from typing import Optional
 
-SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.gif'}
+SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.heic'}
 
 
 def die(msg, code=1):
@@ -374,8 +374,22 @@ def _available_ram_mb() -> int:
         return 0
 
 
-def _convert_image_pair(src: str, fg_out: str, bg_out: str, width: int, height: int, blur: int, quality: int):
+def _decode_heic_to_png(src: str, out_path: str):
+    """Decode a HEIC/HEIF image to PNG via macOS's built-in `sips`, since ffmpeg
+    typically lacks a HEIF decoder."""
+    cmd = ["sips", "-s", "format", "png", src, "--out", out_path]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    return res.returncode, res.stderr.strip()
+
+
+def _convert_image_pair(src: str, fg_out: str, bg_out: str, width: int, height: int, blur: int, quality: int, heic_tmp: Optional[str] = None):
     """Convert one source image into a fg JPEG (pre-scaled to contain) and a pre-blurred/scaled bg JPEG."""
+    if heic_tmp:
+        rc, err = _decode_heic_to_png(src, heic_tmp)
+        if rc != 0:
+            return rc, err
+        src = heic_tmp
+
     scale_fg = f"scale='if(gte(iw/ih,{width}/{height}),{width},-1)':'if(gte(iw/ih,{width}/{height}),-1,{height})'"
     cmd = [
         "ffmpeg", "-y", "-i", src,
@@ -397,6 +411,13 @@ def convert_images_to_jpeg(src_list, tmpdir, width: int, height: int, blur: int,
     unique_srcs = list(dict.fromkeys(src_list))
     fg_map = {src: os.path.join(tmpdir, f"fg_{i:04d}.jpg") for i, src in enumerate(unique_srcs)}
     bg_map = {src: os.path.join(tmpdir, f"bg_{i:04d}.jpg") for i, src in enumerate(unique_srcs)}
+    heic_map = {
+        src: (os.path.join(tmpdir, f"heic_{i:04d}.png") if src.lower().endswith(".heic") else None)
+        for i, src in enumerate(unique_srcs)
+    }
+
+    if any(heic_map.values()):
+        check_dep("sips")
 
     # Each worker runs one ffmpeg process for bg (scale+blur): ~200 MB overhead + frame buffers.
     avail_mb = _available_ram_mb()
@@ -405,7 +426,7 @@ def convert_images_to_jpeg(src_list, tmpdir, width: int, height: int, blur: int,
     workers = min(len(unique_srcs), os.cpu_count() or 4, by_mem)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_convert_image_pair, src, fg_map[src], bg_map[src], width, height, blur, quality): src
+            executor.submit(_convert_image_pair, src, fg_map[src], bg_map[src], width, height, blur, quality, heic_map[src]): src
             for src in unique_srcs
         }
         for future in as_completed(futures):
@@ -467,7 +488,7 @@ def main():
 
     images = gather_images(args.images)
     if not images:
-        die("No images found (supported: jpg/jpeg/png/gif)")
+        die(f"No images found (supported: {', '.join(sorted(SUPPORTED_EXTS))})")
 
     try:
         audio_duration = ffprobe_duration(args.audio)
