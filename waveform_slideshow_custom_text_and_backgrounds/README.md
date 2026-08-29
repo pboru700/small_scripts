@@ -7,6 +7,7 @@
 - Contain + upscale/downscale image scaling (no cropping, aspect preserved)
 - Blurred full‑frame background (stretched source image + adjustable blur strength)
 - Crossfade transitions (`xfade` with selectable style)
+- Optional Ken Burns zoom‑in toward each image's center over its display time (`--zoom`, `--zoom-end-percent`)
 - Semi‑transparent bottom bar with centered text
 - Waveform visualization (FFmpeg `showwaves` mode=cline)
   - Direction: centered (`both`), single‑sided `top` or `bottom`
@@ -80,6 +81,9 @@ python3 waveform_argparse.py \
 - `--width`, `--height`: Target video dimensions.
 - `--seconds-per-image`: Duration each image is shown (excluding fade overlap portion).
 - `--fade-duration`: Duration of crossfade; auto‑reduced to half if >= seconds per image.
+- `--zoom`: Enable a slow zoom‑in toward the center of each image for the whole time it is on screen (off by default).
+- `--zoom-end-percent`: On‑screen scale of the image on its last frame before the transition, in percent (`100` = no zoom, `110` = zoomed in 10%). Default `110`. Values `<= 100` disable the zoom. Only used with `--zoom`.
+- `--zoom-supersample`: Supersample factor for the zoom stage (default `4`). The zoom crops in whole pixels, which at a slow zoom looks like a 1px stepping/jitter; rendering the crop from an enlarged frame shrinks the step to `1/factor` px. Higher = smoother but slower and more memory (try `6`–`8` for short or aggressive zooms and low resolutions; `1`–`2` to render faster). Capped so the enlarged frame stays ≤ 7680px wide. Only used with `--zoom`.
 - `--wave-height`: Height of waveform overlay region.
 - `--wave-direction`: Waveform style: `both` (centered, double‑sided), `top`, or `bottom` single‑sided bars.
 - `--wave-round`: Gaussian blur sigma to soften/round waveform bars (0 disables).

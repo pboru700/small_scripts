@@ -6,6 +6,7 @@ Generate a video slideshow from a folder of images and an MP3 audio track with:
  - Each image scaled to "contain" within target while preserving aspect ratio (upscale if smaller, downscale if larger)
  - Blurred stretched background of each image filling full frame
  - Crossfade transitions between images
+ - Optional slow Ken Burns zoom-in toward each image's center during its display time
  - Bottom blurred bar with centered text
  - Optional logo overlay
  - Loop images if audio is longer than total image display time
@@ -18,6 +19,7 @@ Usage example:
             --width 1920 --height 1080 \
             --seconds-per-image 10 \
             --fade-duration 0.5 \
+            --zoom --zoom-end-percent 110 \
             --bar-blur 20 \
             --text "Sample Title" \
             --text-size 42 \
@@ -36,6 +38,10 @@ from math import ceil
 from typing import Optional
 
 SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.heic'}
+
+# FFmpeg's image2 demuxer loops still images at 25 fps by default; the rest of the
+# pipeline inherits that rate, so the zoom increment is computed against it.
+INPUT_FPS = 25
 
 
 def die(msg, code=1):
@@ -116,6 +122,50 @@ def _anim_y_expr(height: int, bar_h: int, drawbox_y: int,
     )
 
 
+def _zoom_filter_suffix(
+    zoom_enabled: bool,
+    zoom_end_percent: float,
+    seconds_per_image: float,
+    width: int,
+    height: int,
+    fps: int = INPUT_FPS,
+    supersample: int = 4,
+) -> str:
+    """Return a ",..." filter chain that slowly pushes each still toward its
+    center over its display time, or "" when the feature is disabled.
+
+    zoom_end_percent is the on-screen scale of the image on the last frame before
+    the transition to the next image: 100 = no zoom, 110 = zoomed in by 10%.
+
+    Anti-shake notes:
+      * The zoom grows linearly with `on` (zoompan's output frame index, which
+        restarts at 0 for every image). zoompan's `zoom` accumulator is avoided:
+        it does not persist across frames when d=1, which would freeze the zoom.
+      * The pan offsets x/y are derived from the *same* `on`-based expression as
+        z, not from zoompan's internal quantized `zoom` variable. Mixing the two
+        lets the crop window and the zoom level disagree by sub-pixel amounts
+        each frame, which reads as a random-direction jitter.
+      * zoompan still snaps the crop origin to whole input pixels. At the default
+        (very slow) zoom that step is a ~1px pop every few frames -- clearly
+        visible. Cropping from a `supersample`x-enlarged frame shrinks the step
+        to 1/supersample px; measured smooth (no direction reversals) at >=4.
+        The factor is capped so the enlarged frame stays <= 7680 px wide.
+    """
+    if not zoom_enabled or zoom_end_percent <= 100.0:
+        return ""
+    target = zoom_end_percent / 100.0
+    total_frames = max(1, int(round(seconds_per_image * fps)))
+    inc = (target - 1.0) / total_frames
+    z = f"min(1+{inc:.8f}*on,{target:.6f})"
+    ss = max(1, min(supersample, 7680 // max(1, width)))
+    pre = f"scale=iw*{ss}:ih*{ss}:flags=bicubic," if ss > 1 else ""
+    return (
+        f",{pre}zoompan=z='{z}'"
+        f":x='(iw-iw/({z}))/2':y='(ih-ih/({z}))/2'"
+        f":d=1:s={width}x{height}:fps={fps},format=yuv420p"
+    )
+
+
 def slides_needed_for_audio(audio_duration: float, seconds_per_image: float, fade_duration: float) -> int:
     """
     Number of image inputs needed so the xfade chain lasts at least audio_duration.
@@ -157,15 +207,28 @@ def build_slideshow_only_filter_complex(
     xfade_name: str,
     force_rgba: bool,
     out_label: str = "slide",
+    zoom_enabled: bool = False,
+    zoom_end_percent: float = 110.0,
+    zoom_fps: int = INPUT_FPS,
+    zoom_supersample: int = 4,
 ):
     """Build filtergraph that outputs a slideshow video only (no bar/logo).
 
     bg inputs start at index bg_offset and are pre-rendered at target dimensions,
     so no scale or boxblur is needed in the filtergraph.
+
+    When zoom_enabled, each image (composited over its blurred background) is
+    slowly zoomed toward its center over its display time, ending at
+    zoom_end_percent of its original scale on the final frame before the
+    crossfade to the next image.
     """
     step = seconds_per_image - transition_dur
     fc_parts = []
     pix = "rgba" if force_rgba else "yuva420p"
+    zoom_suffix = _zoom_filter_suffix(
+        zoom_enabled, zoom_end_percent, seconds_per_image, width, height, zoom_fps,
+        zoom_supersample,
+    )
 
     for i in range(len(fg_inputs)):
         fc_parts.append(
@@ -175,7 +238,7 @@ def build_slideshow_only_filter_complex(
         fc_parts.append(
             f"[{bg_offset + i}:v]format=yuv420p,setsar=1,trim=duration={seconds_per_image:.6f},setpts=PTS-STARTPTS[bg{i}]"
         )
-        fc_parts.append(f"[bg{i}][fg{i}]overlay=x=(W-w)/2:y=(H-h)/2,format=yuv420p[v{i}]")
+        fc_parts.append(f"[bg{i}][fg{i}]overlay=x=(W-w)/2:y=(H-h)/2,format=yuv420p{zoom_suffix}[v{i}]")
 
     if len(fg_inputs) == 1:
         fc_parts.append(f"[v0]format=yuv420p[{out_label}]")
@@ -282,10 +345,16 @@ def build_filter_complex(
     slide_in_delay: float = 0.0,
     visible_dur: float = 0.0,
     slide_dur: float = 0.0,
+    zoom_enabled: bool = False,
+    zoom_end_percent: float = 110.0,
+    zoom_fps: int = INPUT_FPS,
+    zoom_supersample: int = 4,
 ):
     slide_fc = build_slideshow_only_filter_complex(
         fg_inputs, bg_offset, seconds_per_image, transition_dur, width, height,
         xfade_name, force_rgba, out_label="slide",
+        zoom_enabled=zoom_enabled, zoom_end_percent=zoom_end_percent, zoom_fps=zoom_fps,
+        zoom_supersample=zoom_supersample,
     )
     overlay_fc = build_overlay_filter_complex(
         "slide", logo_index, width, height, bar_h, bar_style, bar_color, bar_alpha,
@@ -457,6 +526,9 @@ def parse_args():
     p.add_argument("--bar-slide-in-delay", type=float, default=3.0, help="Seconds before the bar slides up into view (default: 3)")
     p.add_argument("--bar-visible-duration", type=float, default=30.0, help="Seconds the bar remains visible before sliding back down (default: 30)")
     p.add_argument("--bar-slide-duration", type=float, default=1.0, help="Duration of each slide animation in seconds, both in and out (default: 1)")
+    p.add_argument("--zoom", action="store_true", help="Enable a slow Ken Burns zoom-in toward the center of each image during its display time")
+    p.add_argument("--zoom-end-percent", type=float, default=110.0, help="On-screen scale of the image on its last frame before the transition, in percent (100 = no zoom, 110 = zoomed in 10%%). Only used with --zoom.")
+    p.add_argument("--zoom-supersample", type=int, default=4, help="Supersample factor for the zoom stage: higher = smoother motion (less 1px stepping), but slower and more memory. Try 6-8 for short/aggressive zooms or low resolutions; 1-2 to render faster. Capped so the enlarged frame stays <=7680px wide. Only used with --zoom.")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
     p.add_argument("--text-size", type=int, default=54, help="Font size for bottom bar text")
     p.add_argument("--font", default="", help="Optional font file path for drawtext")
@@ -500,6 +572,11 @@ def main():
         fade_dur = args.seconds_per_image / 2.0
         print(f"Warning: fade-duration >= seconds-per-image; reduced to {fade_dur}")
 
+    zoom_enabled = args.zoom
+    if zoom_enabled and args.zoom_end_percent <= 100.0:
+        print(f"Warning: --zoom-end-percent {args.zoom_end_percent} <= 100; zoom disabled (nothing to zoom into).")
+        zoom_enabled = False
+
     needed = slides_needed_for_audio(audio_duration, args.seconds_per_image, fade_dur)
     chosen = [images[i % len(images)] for i in range(needed)]
 
@@ -526,6 +603,9 @@ def main():
             slide_in_delay=args.bar_slide_in_delay,
             visible_dur=args.bar_visible_duration,
             slide_dur=args.bar_slide_duration,
+            zoom_enabled=zoom_enabled,
+            zoom_end_percent=args.zoom_end_percent,
+            zoom_supersample=args.zoom_supersample,
         )
 
         encoder_choice = args.encoder
@@ -567,6 +647,9 @@ def main():
                     xfade_name=args.fade_name,
                     force_rgba=args.force_rgba,
                     out_label="slide",
+                    zoom_enabled=zoom_enabled,
+                    zoom_end_percent=args.zoom_end_percent,
+                    zoom_supersample=args.zoom_supersample,
                 )
                 seg_cmd = ["ffmpeg", "-y"]
                 for img in seg_fg:
