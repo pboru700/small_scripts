@@ -41,7 +41,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, pi
 from typing import List, Optional, Sequence
 
 SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.heic'}
@@ -59,6 +59,11 @@ LOGO_SIZE = 105
 LOGO_MARGIN = 10
 TEXT_COLOR = "#ffb000"
 
+# Title card: initial size ("contain" in this fraction of the frame) and the
+# fraction of the bar height it shrinks to when it lands in the bar.
+TITLE_CARD_FILL = 1.0
+TITLE_CARD_LANDED_HEIGHT = 0.8
+
 
 # --------------------------------------------------------------------------- #
 # Settings
@@ -73,6 +78,10 @@ class Settings:
     fade_dur: float
     fade_name: str
     bg_blur: int
+    # look (applied once per slide during preprocessing)
+    contrast: float
+    saturation: float
+    vignette: float
     # zoom
     zoom_enabled: bool
     zoom_end_percent: float
@@ -93,6 +102,10 @@ class Settings:
     font: str
     logo: str
     force_rgba: bool
+    # title card
+    title_card: str
+    title_card_duration: float
+    title_card_transition: float
     # encoding
     encoder: str
     bitrate: Optional[str]
@@ -110,6 +123,11 @@ class Settings:
         if not self.zoom_enabled:
             return 1
         return max(1, min(self.zoom_supersample, MAX_SUPERSAMPLE_WIDTH // max(1, self.width)))
+
+    @property
+    def title_card_end(self) -> float:
+        """Seconds after which the title card is gone (0 = no card)."""
+        return self.title_card_duration + self.title_card_transition if self.title_card else 0.0
 
     @property
     def frames_per_image(self) -> int:
@@ -291,9 +309,55 @@ def compose_slide(src: str, out_path: str, s: Settings, heic_tmp: Optional[str] 
         "ffmpeg", "-y", "-i", fg_jpg, "-i", bg_jpg,
         "-filter_complex",
         f"[0:v]format={fg_fmt},setsar=1[fg];[1:v]format=yuv420p,setsar=1[bg];"
-        f"[bg][fg]overlay=x=(W-w)/2:y=(H-h)/2,format=yuv420p[out]",
+        f"[bg][fg]overlay=x=(W-w)/2:y=(H-h)/2{look_filters(s)},format=yuv420p[out]",
         "-map", "[out]", "-frames:v", "1", "-c:v", "rawvideo", out_path,
     ])
+
+
+def look_filters(s: Settings) -> str:
+    """Light colour grade + vignette, baked into each slide still (costs
+    nothing per frame). Returns a ",..." suffix, or "" when everything is neutral."""
+    parts = []
+    if s.contrast != 1.0 or s.saturation != 1.0:
+        parts.append(f"eq=contrast={s.contrast:.4f}:saturation={s.saturation:.4f}")
+    if s.vignette > 0:
+        parts.append(f"vignette=angle={s.vignette * pi / 2:.4f}")
+    return "".join("," + p for p in parts)
+
+
+def probe_image_size(path: str):
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=width,height", "-of", "csv=p=0", path],
+                         capture_output=True, text=True)
+    try:
+        w, h = (int(v) for v in out.stdout.strip().split(",")[:2])
+    except ValueError:
+        die(f"Could not read image size of {path}: {out.stderr.strip()}")
+    return w, h
+
+
+def prepare_title_card(tmpdir: str, s: Settings) -> Optional[str]:
+    """Scale the title card once to its on-screen start size ("contain" in the
+    frame, transparency kept) so the per-frame animation starts from a small image."""
+    if not s.title_card:
+        return None
+    src = s.title_card
+    if src.lower().endswith(".heic"):
+        check_dep("sips")
+        heic = os.path.join(tmpdir, "title_heic.png")
+        rc, err = decode_heic_to_png(src, heic)
+        if rc != 0:
+            die(f"Title card conversion failed: {err}")
+        src = heic
+    iw, ih = probe_image_size(src)
+    fit = min(s.width * TITLE_CARD_FILL / iw, s.height * TITLE_CARD_FILL / ih)
+    w, h = max(2, int(iw * fit)), max(2, int(ih * fit))
+    out = os.path.join(tmpdir, "title_card.png")
+    rc, err = run_quiet(["ffmpeg", "-y", "-i", src, "-vf", f"format=rgba,scale={w}:{h}:flags=lanczos",
+                         "-frames:v", "1", out])
+    if rc != 0:
+        die(f"Title card conversion failed: {err}")
+    return out
 
 
 def prepare_slides(src_list: List[str], tmpdir: str, s: Settings) -> List[str]:
@@ -332,7 +396,7 @@ def escape_drawtext_text(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'").replace("%", "%%")
 
 
-def build_drawtext_options(text: str, size: int, fontfile: str, y_pos) -> str:
+def build_drawtext_options(text: str, size: int, fontfile: str, y_pos, alpha: str = "") -> str:
     parts = []
     if fontfile:
         escaped_font = fontfile.replace("'", "\\'")
@@ -345,7 +409,28 @@ def build_drawtext_options(text: str, size: int, fontfile: str, y_pos) -> str:
         f"y={y_pos}",
         "box=0",
     ]
+    if alpha:
+        parts.append(f"alpha={alpha}")
     return ":".join(parts)
+
+
+# Last fraction of the title card's glide during which the card fades out and
+# the bar text fades in (a crossfade, so the title seems to land in the bar).
+TITLE_CARD_HANDOFF = 0.3
+
+
+def title_handoff(s: Settings):
+    """(start, duration) of the card -> bar-text crossfade."""
+    trans = max(0.04, s.title_card_transition)
+    return s.title_card_duration + trans * (1 - TITLE_CARD_HANDOFF), trans * TITLE_CARD_HANDOFF
+
+
+def bar_text_alpha(s: Settings) -> str:
+    """Bar text opacity: hidden until the title card lands, then fades in."""
+    if not s.title_card:
+        return ""
+    st, d = title_handoff(s)
+    return f"clip((t-{st:.4f})/{d:.4f}\\,0\\,1)"
 
 
 def bar_y_expr(s: Settings) -> str:
@@ -445,6 +530,33 @@ def build_slideshow_filter(first_slide: int, n_slides: int, s: Settings, out_lab
     return ";".join(parts)
 
 
+def title_card_filter(src_label: str, card_index: int, card_size, s: Settings, out_label: str) -> str:
+    """Title card over [src_label]: shown centred for title_card_duration, then
+    shrinks and glides down into the bottom bar (eased) while the bar slides up
+    underneath it; as it lands it crossfades into the bar text.
+
+    `t` is global video time in both scale and overlay (the card input starts
+    at 0 and segments are shifted to global time before this filter)."""
+    cw, ch = card_size
+    hold, trans = s.title_card_duration, max(0.04, s.title_card_transition)
+    bar_h = s.bar_height if s.bar_height > 0 else s.height // 9
+    end_scale = min(1.0, bar_h * TITLE_CARD_LANDED_HEIGHT / ch, s.width * 0.9 / cw)
+    # eased progress 0..1 (smoothstep); \\, keeps commas inside the expressions
+    p = f"clip((t-{hold:.4f})/{trans:.4f}\\,0\\,1)"
+    e = f"({p})*({p})*(3-2*({p}))"
+    z = f"(1-(1-{end_scale:.6f})*{e})"
+    cy_end = s.height - bar_h / 2
+    cy = f"({s.height / 2:.2f}+({cy_end:.2f}-{s.height / 2:.2f})*{e})"
+    fade_start, fade_dur = title_handoff(s)
+    return (
+        f"[{card_index}:v]format=rgba,"
+        f"scale=w={cw}*{z}:h={ch}*{z}:eval=frame:flags=bicubic,"
+        f"fade=t=out:st={fade_start:.4f}:d={fade_dur:.4f}:alpha=1[tcard];"
+        f"[{src_label}][tcard]overlay=x=(W-w)/2:y={cy}-h/2:eval=frame:eof_action=pass:format=auto,"
+        f"format=yuv420p[{out_label}]"
+    )
+
+
 def build_overlay_filter(slide_label: str, logo_index: Optional[int], s: Settings) -> str:
     """Adds the animated bottom bar (+text) and the logo to [slide_label] -> [outv]."""
     parts = []
@@ -459,7 +571,7 @@ def build_overlay_filter(slide_label: str, logo_index: Optional[int], s: Setting
         chain = f"{src}drawbox=x=0:y={bar_y}:w=iw:h={bar_h}:color={color}:t=fill"
         if s.text:
             chain += ",drawtext=" + build_drawtext_options(
-                s.text, s.text_size, s.font, f"{bar_y}+({bar_h}-text_h)/2")
+                s.text, s.text_size, s.font, f"{bar_y}+({bar_h}-text_h)/2", bar_text_alpha(s))
         parts.append(chain + "[slide_bar]")
     else:  # blur: frosted strip cut from the bar's resting position, slid in with overlay
         blur_chain = f"crop=iw:{bar_h}:0:{s.bar_top},boxblur={s.bar_blur}:5"
@@ -467,7 +579,7 @@ def build_overlay_filter(slide_label: str, logo_index: Optional[int], s: Setting
             blur_chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={s.bar_tint}@{s.bar_tint_alpha:.3f}:t=fill"
         if s.text:
             blur_chain += ",drawtext=" + build_drawtext_options(
-                s.text, s.text_size, s.font, "(h-text_h)/2")
+                s.text, s.text_size, s.font, "(h-text_h)/2", bar_text_alpha(s))
         parts += [
             f"{src}split=2[base][blursrc]",
             f"[blursrc]{blur_chain}[blurredbar]",
@@ -601,10 +713,14 @@ def still_inputs(paths: Sequence[str]) -> List[str]:
 
 
 def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
-                    x264_threads: Optional[int]) -> List[str]:
+                    x264_threads: Optional[int], title_card: Optional[str] = None,
+                    title_card_size=None) -> List[str]:
     seg_slides = slides[seg.first_slide:seg.last_slide + 1]
     n = len(seg_slides)
     logo_index = n if s.logo else None
+    # The card only goes into segments that start before it has disappeared.
+    use_card = bool(title_card) and seg.start_frame < s.title_card_end * FPS
+    card_index = n + (1 if s.logo else 0)
 
     trim = f"trim=start_frame={seg.trim_start}"
     if seg.trim_end is not None:
@@ -614,23 +730,29 @@ def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
         # Shift to global time so the bar animation (which uses t) lines up across segments.
         f"[chain]{trim},setpts=PTS-STARTPTS+{seg.start_frame}/({FPS}*TB)[slide]",
         build_overlay_filter("slide", logo_index, s),
-        "[outv]setpts=PTS-STARTPTS[seg]",
+    ] + ([title_card_filter("outv", card_index, title_card_size, s, "titled")] if use_card else []) + [
+        f"[{'titled' if use_card else 'outv'}]setpts=PTS-STARTPTS[seg]",
     ])
     cmd = ["ffmpeg", "-y"] + still_inputs(seg_slides)
     if s.logo:
         cmd += ["-i", s.logo]
+    if use_card:
+        cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{s.title_card_end + 1 / FPS:.4f}",
+                "-i", title_card]
     cmd += ["-filter_complex", graph, "-map", "[seg]", "-an"]
     cmd += encoder_args(s, x264_threads) + ["-pix_fmt", "yuv420p", out_path]
     return cmd
 
 
 def render_segments(segments: List[Segment], slides: List[str], tmpdir: str, s: Settings,
-                    n_workers: int) -> List[str]:
+                    n_workers: int, title_card: Optional[str] = None) -> List[str]:
     x264_threads = s.threads or max(1, (os.cpu_count() or 1) // n_workers)
+    card_size = probe_image_size(title_card) if title_card else None
     tasks = []
     for seg in segments:
         out = os.path.join(tmpdir, f"segment_{seg.index:03d}.mp4")
-        tasks.append((seg.index, segment_command(seg, slides, out, s, x264_threads), out))
+        cmd = segment_command(seg, slides, out, s, x264_threads, title_card, card_size)
+        tasks.append((seg.index, cmd, out))
 
     print(f"Rendering {len(tasks)} segments with {n_workers} parallel workers...")
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
@@ -659,7 +781,8 @@ def join_segments(seg_paths: List[str], audio: str, out_path: str, tmpdir: str):
 
 
 def render_video(slides: List[str], audio: str, audio_duration: float, out_path: str,
-                 tmpdir: str, s: Settings, max_per_segment: int, workers_override: Optional[int]):
+                 tmpdir: str, s: Settings, max_per_segment: int, workers_override: Optional[int],
+                 title_card: Optional[str] = None):
     n = len(slides)
     cpus = os.cpu_count() or 2
 
@@ -677,7 +800,7 @@ def render_video(slides: List[str], audio: str, audio_duration: float, out_path:
                              ceil(audio_duration * FPS), s)
     n_workers = min(n_workers, len(segments))
 
-    seg_paths = render_segments(segments, slides, tmpdir, s, n_workers)
+    seg_paths = render_segments(segments, slides, tmpdir, s, n_workers, title_card)
     join_segments(seg_paths, audio, out_path, tmpdir)
 
 
@@ -701,7 +824,7 @@ def parse_args():
     p.add_argument("--bar-blur", type=int, default=20, help="Blur radius for --bar-style blur (boxblur radius)")
     p.add_argument("--bar-tint", default="#00464a", help="Tint color overlaid on the blurred bar for --bar-style blur (hex). Empty string disables tint.")
     p.add_argument("--bar-tint-alpha", type=float, default=0.6, help="Opacity of the bar tint for --bar-style blur (0.0 - 1.0)")
-    p.add_argument("--bar-slide-in-delay", type=float, default=3.0, help="Seconds before the bar slides up into view (default: 3)")
+    p.add_argument("--bar-slide-in-delay", type=float, default=None, help="Seconds before the bar slides up into view (default: 3, or --title-card-duration when a title card is used)")
     p.add_argument("--bar-visible-duration", type=float, default=30.0, help="Seconds the bar remains visible before sliding back down (default: 30)")
     p.add_argument("--bar-slide-duration", type=float, default=1.0, help="Duration of each slide animation in seconds, both in and out (default: 1)")
     p.add_argument("--zoom", action=argparse.BooleanOptionalAction, default=True, help="Slow Ken Burns zoom-in toward the center of each image during its display time (default: on; --no-zoom disables)")
@@ -712,6 +835,12 @@ def parse_args():
     p.add_argument("--font", default="/Library/Fonts/BebasNeue-Regular.ttf", help="Optional font file path for drawtext")
     p.add_argument("--fade-name", default="fade", help="FFmpeg xfade transition name (e.g. fade, wipeleft, circleopen)")
     p.add_argument("--logo", default="", help="Optional logo image path")
+    p.add_argument("--title-card", default="", help="Optional title card image (PNG; transparency recommended) shown centred at the start, then shrinking down into the bottom bar")
+    p.add_argument("--title-card-duration", type=float, default=4.0, help="Seconds the title card stays fully visible before moving into the bar (default: 4)")
+    p.add_argument("--title-card-transition", type=float, default=None, help="Seconds the title card takes to glide into the bar (default: --bar-slide-duration, or 1 if that is 0)")
+    p.add_argument("--contrast", type=float, default=1.05, help="Slide contrast (1.0 = unchanged, default: 1.05)")
+    p.add_argument("--saturation", type=float, default=1.15, help="Slide saturation (1.0 = unchanged, default: 1.15)")
+    p.add_argument("--vignette", type=float, default=0.3, help="Vignette strength 0-1 (0 = off, default: 0.3; 0.4 = FFmpeg's default vignette)")
     p.add_argument("--encoder", default="auto", choices=["auto", "x264", "vt_h264", "vt_hevc"], help="Video encoder: auto tries h264_videotoolbox if available on macOS")
     p.add_argument("--bitrate", default="6M", help="Target video bitrate (e.g. 6M). If set, used instead of CRF for chosen encoder where applicable.")
     p.add_argument("--crf", type=int, default=18, help="CRF value for x264 (quality). Ignored if --bitrate provided or hardware encoder without CRF.")
@@ -732,6 +861,8 @@ def validate_inputs(args):
         die(f"Audio file not found: {args.audio}")
     if args.logo and not os.path.isfile(args.logo):
         die(f"Logo file not found: {args.logo}")
+    if args.title_card and not os.path.isfile(args.title_card):
+        die(f"Title card file not found: {args.title_card}")
 
 
 def make_settings(args) -> Settings:
@@ -745,18 +876,29 @@ def make_settings(args) -> Settings:
         print(f"Warning: --zoom-end-percent {args.zoom_end_percent} <= 100; zoom disabled (nothing to zoom into).")
         zoom_enabled = False
 
+    title_trans = args.title_card_transition
+    if title_trans is None:
+        title_trans = args.bar_slide_duration if args.bar_slide_duration > 0 else 1.0
+    bar_delay = args.bar_slide_in_delay
+    if bar_delay is None:
+        # With a title card the bar rises exactly while the card glides into it.
+        bar_delay = args.title_card_duration if args.title_card else 3.0
+
     return Settings(
         width=args.width, height=args.height,
         seconds_per_image=args.seconds_per_image, fade_dur=fade_dur, fade_name=args.fade_name,
         bg_blur=args.blur,
+        contrast=args.contrast, saturation=args.saturation, vignette=max(0.0, min(1.0, args.vignette)),
         zoom_enabled=zoom_enabled, zoom_end_percent=args.zoom_end_percent,
         zoom_supersample=args.zoom_supersample,
         bar_height=args.bar_height, bar_style=args.bar_style, bar_color=args.bar_color,
         bar_alpha=args.bar_alpha, bar_blur=args.bar_blur, bar_tint=args.bar_tint,
-        bar_tint_alpha=args.bar_tint_alpha, bar_slide_in_delay=args.bar_slide_in_delay,
+        bar_tint_alpha=args.bar_tint_alpha, bar_slide_in_delay=bar_delay,
         bar_visible_duration=args.bar_visible_duration, bar_slide_duration=args.bar_slide_duration,
         text=args.text, text_size=args.text_size, font=args.font, logo=args.logo,
         force_rgba=args.force_rgba,
+        title_card=args.title_card, title_card_duration=max(0.0, args.title_card_duration),
+        title_card_transition=max(0.0, title_trans),
         encoder=resolve_encoder(args.encoder), bitrate=args.bitrate, crf=args.crf, threads=args.threads,
     )
 
@@ -781,10 +923,11 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="wave_jpeg_")
     try:
         slides = prepare_slides(chosen, tmpdir, s)
+        title_card = prepare_title_card(tmpdir, s)
 
         max_per_segment = max(2, args.max_inputs_per_pass or len(slides))
         render_video(slides, args.audio, audio_duration, args.output, tmpdir, s,
-                     max_per_segment, args.segment_workers)
+                     max_per_segment, args.segment_workers, title_card)
 
         print("Done:", args.output)
         print(f"Audio length: {audio_duration:.2f}s, images used: {len(slides)}, resolution: {s.width}x{s.height}")

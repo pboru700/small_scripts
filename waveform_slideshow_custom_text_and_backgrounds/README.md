@@ -12,6 +12,8 @@
   - `blur` style: frosted glass with optional color tint
   - `solid` style: flat semi-transparent color
 - Optional logo, bottom-left
+- Optional title card (PNG): shown at the start, then glides down and shrinks into the bar, crossfading into the bar text
+- Light color grade: a bit more contrast and saturation plus a soft vignette (on by default, baked into each slide, so it costs no render time)
 - HEIC/HEIF support (decoded with macOS `sips`)
 - Images loop when the audio is longer than one pass through the folder
 - Hardware encoding on macOS (VideoToolbox), chosen automatically
@@ -49,7 +51,8 @@ python3 waveform_argparse.py \
   --bar-style blur --bar-blur 20 --bar-tint "#00464a" --bar-tint-alpha 0.6 \
   --text "Sample Title" --text-size 96 \
   --font /Library/Fonts/Arial.ttf \
-  --logo logo.png
+  --logo logo.png \
+  --title-card title.png --title-card-duration 4
 ```
 
 ## Argument Reference
@@ -70,6 +73,15 @@ python3 waveform_argparse.py \
 | `--fade-name` | `fade` | FFmpeg `xfade` transition (`fade`, `wipeleft`, `circleopen`, …). |
 | `--blur` | `10` | Background blur radius (boxblur). |
 
+### Look
+| Flag | Default | Description |
+|---|---|---|
+| `--contrast` | `1.05` | Slide contrast (`1` = unchanged). |
+| `--saturation` | `1.15` | Slide saturation (`1` = unchanged). |
+| `--vignette` | `0.3` | Vignette strength, `0`–`1` (`0` = off, `0.4` = FFmpeg's default vignette). |
+
+The look is applied to the slides only, so the bar, text, logo and title card keep their exact colors. Use `--contrast 1 --saturation 1 --vignette 0` for the untouched images.
+
 ### Zoom
 | Flag | Default | Description |
 |---|---|---|
@@ -87,13 +99,22 @@ python3 waveform_argparse.py \
 | `--bar-tint-alpha` | `0.6` | Tint opacity. |
 | `--bar-color` | `#00464a` | Color for the `solid` style. |
 | `--bar-alpha` | `0.7` | Opacity for the `solid` style. |
-| `--bar-slide-in-delay` | `3` | Seconds before the bar slides up. |
+| `--bar-slide-in-delay` | `3` | Seconds before the bar slides up. With `--title-card` the default is `--title-card-duration`, so the bar rises while the card glides into it. |
 | `--bar-visible-duration` | `30` | Seconds the bar stays fully visible before sliding down. |
 | `--bar-slide-duration` | `1` | Length of each slide animation. `0` keeps the bar static for the whole video. |
 | `--text` | empty | Text centered in the bar (color `#ffb000`). |
 | `--text-size` | `114` | Font size. |
 | `--font` | `/Library/Fonts/BebasNeue-Regular.ttf` | Font file for the text. |
 | `--logo` | none | Logo image, scaled to 105x105, placed bottom-left. Transparency is kept. |
+
+### Title card
+| Flag | Default | Description |
+|---|---|---|
+| `--title-card` | none | Image (PNG recommended) shown centered at the start, scaled to fit the frame. A PNG with a transparent background (e.g. just the stylized title) works best, because the slide stays visible behind it. |
+| `--title-card-duration` | `4` | Seconds the card stays fully visible. |
+| `--title-card-transition` | `--bar-slide-duration` | Seconds the card takes to shrink and glide into the bar. In the last 30% of the glide it fades out while the bar text fades in. After that the card is gone for good. |
+
+Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades out.
 
 ### Encoding and performance
 | Flag | Default | Description |
@@ -107,8 +128,8 @@ python3 waveform_argparse.py \
 | `--force-rgba` | off | Use RGBA for the logo overlay. Only needed for special transparency cases. |
 
 ## How it works
-1. **Prepare slides (parallel).** For every unique image: a "contain"-scaled foreground and a stretched, blurred background are written as JPEGs. They are then composited once into a lossless slide still. HEIC files are first converted with `sips`.
-2. **Render segments (parallel).** The timeline is split into segments, at least one per worker. Each ffmpeg process reads its slides as single frames, so decoding and zoom supersampling happen once per slide, not once per frame. It then zooms, crossfades, adds the bar, text and logo, and encodes with the final settings. Segment boundaries sit just after a crossfade has finished, so the cuts are invisible.
+1. **Prepare slides (parallel).** For every unique image: a "contain"-scaled foreground and a stretched, blurred background are written as JPEGs. They are then composited once into a lossless slide still, with the color grade and vignette applied. HEIC files are first converted with `sips`. The title card is pre-scaled once.
+2. **Render segments (parallel).** The timeline is split into segments, at least one per worker. Each ffmpeg process reads its slides as single frames, so decoding and zoom supersampling happen once per slide, not once per frame. It then zooms, crossfades, adds the bar, text, logo and (in the first segments only) the title card, and encodes with the final settings. Segment boundaries sit just after a crossfade has finished, so the cuts are invisible.
 3. **Join.** Segments are concatenated without re-encoding (`-c copy`) and the audio is encoded to AAC. The output is cut to the audio length.
 
 Slide timing: slide `n` starts fading in at `n × (seconds_per_image − fade_duration)`. If the audio is longer than one pass through the folder, the image list repeats.
