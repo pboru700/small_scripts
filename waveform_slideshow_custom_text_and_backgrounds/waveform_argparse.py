@@ -836,7 +836,7 @@ def parse_args():
     p.add_argument("--fade-name", default="fade", help="FFmpeg xfade transition name (e.g. fade, wipeleft, circleopen)")
     p.add_argument("--logo", default="", help="Optional logo image path")
     p.add_argument("--title-card", default="", help="Optional title card image (PNG; transparency recommended) shown centred at the start, then shrinking down into the bottom bar")
-    p.add_argument("--title-card-duration", type=float, default=4.0, help="Seconds the title card stays fully visible before moving into the bar (default: 4)")
+    p.add_argument("--title-card-duration", type=float, default=6.0, help="Seconds the title card stays fully visible before moving into the bar (default: 4)")
     p.add_argument("--title-card-transition", type=float, default=None, help="Seconds the title card takes to glide into the bar (default: --bar-slide-duration, or 1 if that is 0)")
     p.add_argument("--contrast", type=float, default=1.05, help="Slide contrast (1.0 = unchanged, default: 1.05)")
     p.add_argument("--saturation", type=float, default=1.15, help="Slide saturation (1.0 = unchanged, default: 1.15)")
