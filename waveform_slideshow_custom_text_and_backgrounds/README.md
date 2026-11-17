@@ -1,6 +1,6 @@
 # Slideshow Video Generator
 
-`waveform_argparse.py` builds an MP4 slideshow from a folder of images and an audio track. Each image is scaled to fit a fixed resolution (aspect preserved), placed over a blurred, stretched copy of itself, given a slow camera move (zoom in or out, zoom toward a corner, or a pan), and blended into the next one with a varying calm transition. An animated frosted-glass bar with custom text slides in at the bottom, and an optional logo is overlaid. The video lasts as long as the audio, with the last 20 s gently dimmed as an end screen; images loop if needed.
+`waveform_argparse.py` builds an MP4 slideshow from a folder of images and an audio track. Each image is scaled to fit a fixed resolution (aspect preserved), placed over a blurred, stretched copy of itself, given a slow camera move (zoom in or out, zoom toward a corner, or a pan), and blended into the next one with a varying calm transition. An animated frosted-glass bar with custom text slides in at the bottom, and an optional logo sits at its left end, glowing softly while someone speaks. The video lasts as long as the audio, with the last 20 s gently dimmed as an end screen; images loop if needed.
 
 ## Features
 - Fixed output resolution (default 1920x1080)
@@ -12,7 +12,7 @@
 - Bottom bar with centered text that slides up, stays visible, then slides away
   - `blur` style: frosted glass with optional color tint
   - `solid` style: flat semi-transparent color
-- Optional logo, bottom-left
+- Optional logo (`--logo`) at the left end of the bar (vertically centred on it, sized to fit inside), reacting to the voice: soft glow (default), pulse or ring; transparent margins trimmed automatically
 - Optional title card (PNG): shown at the start, then glides down and shrinks into the bar, crossfading into the bar text
 - Light color grade: a bit more contrast and saturation plus a soft vignette (on by default, baked into each slide, so it costs no render time)
 - HEIC/HEIF support (decoded with macOS `sips`)
@@ -106,10 +106,12 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 | `--bar-slide-in-delay` | `3` | Seconds before the bar slides up. With `--title-card` the default is `--title-card-duration`, so the bar rises while the card glides into it. |
 | `--bar-visible-duration` | `30` | Seconds the bar stays fully visible before sliding down. |
 | `--bar-slide-duration` | `1` | Length of each slide animation. `0` keeps the bar static for the whole video. |
-| `--text` | empty | Text centered in the bar (color `#ffb000`). |
+| `--text` | empty | Text centered in the bar (color `#ffb000` with a 6 px black outline). |
 | `--text-size` | `114` | Font size. |
 | `--font` | `/Library/Fonts/BebasNeue-Regular.ttf` | Font file for the text. |
-| `--logo` | none | Logo image, scaled to 105x105, placed bottom-left. Transparency is kept. |
+| `--logo` | none | Logo image (PNG with transparency recommended). Transparent margins are trimmed automatically. It is centred vertically on the bar (at its resting position) at the left edge. Empty or a missing file: no logo (a missing file prints a warning). |
+| `--logo-effect` | `glow` | How the logo reacts to the voice. `glow`: a soft orange (`#ff5800`) glow behind the logo lights up while someone speaks. `pulse`: the logo grows by up to 4%. `ring`: a thin orange (`#ff5800`) ring around the logo widens and brightens. `none`: static logo. The reaction follows phrases, not syllables (fast rise, ~0.45 s fall), and rests in pauses. |
+| `--logo-size` | bar height − 20 | Longest side of the logo in px. The default (100 px for a 120 px bar) keeps the logo and its effect inside the bar. Without a bar: 105 px in the bottom-left corner. |
 
 ### Title card
 | Flag | Default | Description |
