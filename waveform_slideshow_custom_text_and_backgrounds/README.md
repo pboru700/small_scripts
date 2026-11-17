@@ -1,13 +1,14 @@
 # Slideshow Video Generator
 
-`waveform_argparse.py` builds an MP4 slideshow from a folder of images and an audio track. Each image is scaled to fit a fixed resolution (aspect preserved), placed over a blurred, stretched copy of itself, slowly zoomed toward its center, and crossfaded into the next one. An animated frosted-glass bar with custom text slides in at the bottom, and an optional logo is overlaid. The video lasts as long as the audio; images loop if needed.
+`waveform_argparse.py` builds an MP4 slideshow from a folder of images and an audio track. Each image is scaled to fit a fixed resolution (aspect preserved), placed over a blurred, stretched copy of itself, given a slow camera move (zoom in or out, zoom toward a corner, or a pan), and blended into the next one with a varying calm transition. An animated frosted-glass bar with custom text slides in at the bottom, and an optional logo is overlaid. The video lasts as long as the audio, with the last 20 s gently dimmed as an end screen; images loop if needed.
 
 ## Features
 - Fixed output resolution (default 1920x1080)
 - "Contain" scaling: no cropping, aspect preserved, small images upscaled
 - Blurred full-frame background made from the same image
-- Slow Ken Burns zoom toward each image's center (on by default, `--no-zoom` to disable), rendered jitter-free via supersampling
-- Crossfade transitions (`xfade`, any FFmpeg transition name)
+- Slow Ken Burns camera move per slide, varied by default: zoom in, zoom out, zoom toward a corner, pan left/right (`--motion`; `--no-zoom` disables), rendered jitter-free via supersampling
+- Calm transitions picked per slide (`fade`, `fadeblack`, `smooth*`, `circleopen`, `hblur`), or any fixed FFmpeg `xfade` transition (`--fade-name`)
+- End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`); the length does not change
 - Bottom bar with centered text that slides up, stays visible, then slides away
   - `blur` style: frosted glass with optional color tint
   - `solid` style: flat semi-transparent color
@@ -71,7 +72,8 @@ python3 waveform_argparse.py \
 |---|---|---|
 | `--seconds-per-image` | `6` | Time each image is on screen, including its fade-out. |
 | `--fade-duration` | `0.5` | Crossfade length. Reduced to half of `--seconds-per-image` if it is too long. |
-| `--fade-name` | `fade` | FFmpeg `xfade` transition (`fade`, `wipeleft`, `circleopen`, …). |
+| `--fade-name` | `mix` | Transition between slides. `mix` picks a calm one per slide (never twice in a row): `fade`, `fadeblack`, `smoothleft`, `smoothright`, `smoothup`, `smoothdown`, `circleopen`, `hblur`. Can also be one FFmpeg `xfade` name (`fade`, `wipeleft`, …) or a comma-separated list to pick from (`fade,fadeblack`). |
+| `--variation-seed` | `1` | Seed for the per-slide choice of transitions and camera moves. The same seed gives the same video; change it for a different arrangement. |
 | `--blur` | `10` | Background blur radius (boxblur). |
 
 ### Look
@@ -86,8 +88,9 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 ### Zoom
 | Flag | Default | Description |
 |---|---|---|
-| `--zoom` / `--no-zoom` | on | Slow zoom toward the image center during its display time. |
-| `--zoom-end-percent` | `105` | Image scale on its last frame (`100` = no zoom, `110` = 10% closer). Values `<= 100` disable the zoom. |
+| `--zoom` / `--no-zoom` | on | Slow camera move during each slide's display time. |
+| `--motion` | `mix` | `mix`: per slide one of zoom in, zoom out, zoom toward a corner, pan left, pan right (never the same twice in a row). `in`: always zoom toward the center (the old behaviour). `out`: always zoom out. `pan`: only pans. |
+| `--zoom-end-percent` | `105` | Image scale at the most zoomed-in point (`100` = no zoom, `110` = 10% closer). Pans run at this scale. Values `<= 100` disable the camera moves. |
 | `--zoom-supersample` | `6` | The zoom crops in whole pixels, which at slow speeds looks like a 1px jitter. Cropping from an enlarged frame shrinks the step to `1/factor` px. Capped so the enlarged frame is at most 7680 px wide, so at 1080p the effective value is 4. Lower (1–2) renders faster; higher means smoother motion and more memory. |
 
 ### Bottom bar and text
@@ -116,6 +119,12 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 | `--title-card-transition` | `--bar-slide-duration` | Seconds the card takes to shrink and glide into the bar. In the last 30% of the glide it fades out while the bar text fades in. After that the card is gone for good. |
 
 Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades out.
+
+### End screen
+| Option | Default | Description |
+|---|---|---|
+| `--end-screen` | `20` | The last N seconds of the video are dimmed and slightly desaturated (fading in over 1.5 s), as a calmer background for YouTube end-screen elements (YouTube allows 5–20 s). The video length and audio are unchanged. `0` disables. |
+| `--end-screen-dim` | `0.45` | How much darker the slides get at the end (`0.45` = 45% darker; `0`–`1`). |
 
 ### Audio
 | Flag | Default | Description |

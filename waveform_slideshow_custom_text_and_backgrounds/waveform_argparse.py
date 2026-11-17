@@ -37,12 +37,14 @@ Pipeline:
 """
 import argparse
 import os
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from math import ceil, pi
 from typing import List, Optional, Sequence
 
@@ -68,6 +70,27 @@ TEXT_COLOR = "#ffb000"
 TITLE_CARD_FILL = 1.0
 TITLE_CARD_LANDED_HEIGHT = 0.8
 
+# --fade-name mix: calm transitions picked per slide (never the same twice in a row).
+CALM_TRANSITIONS = ("fade", "fadeblack", "smoothleft", "smoothright", "smoothup",
+                    "smoothdown", "circleopen", "hblur")
+
+# --motion mix: camera moves picked per slide (never the same twice in a row).
+#   in / out   zoom toward / away from the centre
+#   corner     zoom in toward one of the four corners
+#   left/right slow pan across the (slightly zoomed-in) image
+MOTION_POOLS = {
+    "mix": ("in", "out", "corner", "left", "right"),
+    "in": ("in",),
+    "out": ("out",),
+    "pan": ("left", "right"),
+}
+# Focus point of a "corner" zoom (fraction of the width/height).
+CORNER_FOCUS = (0.15, 0.85)
+
+# End screen: seconds over which the slides dim, and how much colour they lose.
+END_SCREEN_FADE = 1.5
+END_SCREEN_DESATURATE = 0.3
+
 
 # --------------------------------------------------------------------------- #
 # Settings
@@ -80,7 +103,7 @@ class Settings:
     height: int
     seconds_per_image: float
     fade_dur: float
-    fade_name: str
+    transitions: tuple          # xfade transition names to pick from
     bg_blur: int
     # look (applied once per slide during preprocessing)
     contrast: float
@@ -90,6 +113,8 @@ class Settings:
     zoom_enabled: bool
     zoom_end_percent: float
     zoom_supersample: int
+    motion: str                 # key of MOTION_POOLS
+    variation_seed: int         # seed for the per-slide motion/transition choice
     # bottom bar
     bar_height: int
     bar_style: str
@@ -110,6 +135,9 @@ class Settings:
     title_card: str
     title_card_duration: float
     title_card_transition: float
+    # end screen (None = off): the last seconds of the video are dimmed, for YouTube end cards
+    end_start: Optional[float]
+    end_dim: float
     # encoding
     encoder: str
     bitrate: Optional[str]
@@ -457,10 +485,39 @@ def bar_y_expr(s: Settings) -> str:
     )
 
 
-def zoom_filters(s: Settings) -> str:
+@lru_cache(maxsize=None)
+def _variation_sequence(pool: tuple, seed: int, length: int = 4096) -> tuple:
+    rng = random.Random(seed)
+    seq = []
+    for _ in range(length):
+        options = [x for x in pool if not seq or x != seq[-1]] or list(pool)
+        seq.append(rng.choice(options))
+    return tuple(seq)
+
+
+def variation(pool: tuple, seed: int, j: int):
+    """Deterministic pick for global slide j: the same slide gets the same
+    choice in every segment process (and in every re-render with the same seed)."""
+    if len(pool) == 1:
+        return pool[0]
+    seq = _variation_sequence(tuple(pool), seed)
+    return seq[j % len(seq)]
+
+
+def slide_motion(j: int, s: Settings) -> str:
+    return variation(MOTION_POOLS[s.motion], s.variation_seed, j)
+
+
+def transition_for(j: int, s: Settings) -> str:
+    """xfade transition from slide j-1 into slide j."""
+    return variation(s.transitions, s.variation_seed + 7919, j)
+
+
+def zoom_filters(s: Settings, j: int = 0) -> str:
     """Filter chain that turns ONE still frame into a slide of frames_per_image
-    frames slowly pushing toward the centre. zoom_end_percent is the on-screen
-    scale on the last frame before the transition (100 = none, 110 = +10%).
+    frames with a slow camera move (slide_motion: zoom in/out, zoom toward a
+    corner, or a pan). zoom_end_percent is the on-screen scale at the most
+    zoomed-in point (100 = none, 110 = +10%).
 
     Anti-shake notes:
       * The zoom grows linearly with `on` (zoompan's output frame index, which
@@ -480,13 +537,26 @@ def zoom_filters(s: Settings) -> str:
     """
     target = s.zoom_end_percent / 100.0
     frames = s.frames_per_image
-    inc = (target - 1.0) / max(1, int(round(s.seconds_per_image * FPS)))
-    z = f"min(1+{inc:.8f}*on,{target:.6f})"
+    span = max(1, int(round(s.seconds_per_image * FPS)))
+    inc = (target - 1.0) / span
+    progress = f"min(on/{span},1)"
+    kind = slide_motion(j, s)
+    fx = fy = "0.5"
+    if kind == "out":
+        z = f"max({target:.6f}-{inc:.8f}*on,1)"
+    elif kind in ("left", "right"):
+        z = f"{target:.6f}"
+        fx = f"(1-{progress})" if kind == "left" else progress
+    else:  # in / corner
+        z = f"min(1+{inc:.8f}*on,{target:.6f})"
+        if kind == "corner":
+            rng = random.Random(f"{s.variation_seed}-corner-{j}")
+            fx, fy = (f"{rng.choice(CORNER_FOCUS)}" for _ in range(2))
     ss = s.supersample
     pre = f"scale=iw*{ss}:ih*{ss}:flags=bicubic," if ss > 1 else ""
     return (
         f"{pre}zoompan=z='{z}'"
-        f":x='(iw-iw/({z}))/2':y='(ih-ih/({z}))/2'"
+        f":x='(iw-iw/({z}))*{fx}':y='(ih-ih/({z}))*{fy}'"
         f":d={frames}:s={s.width}x{s.height}:fps={FPS}"
     )
 
@@ -497,9 +567,10 @@ def hold_filters(s: Settings) -> str:
     return f"loop=loop={s.frames_per_image - 1}:size=1,settb=1/{FPS},setpts=N"
 
 
-def xfade_chain(in_labels: List[str], offsets_frames: List[int], s: Settings, out_label: str) -> List[str]:
+def xfade_chain(in_labels: List[str], offsets_frames: List[int], names: List[str],
+                s: Settings, out_label: str) -> List[str]:
     """Chain clips (filter labels) with xfade; clip k starts fading in at
-    offsets_frames[k-1] (frames from the start of the chain).
+    offsets_frames[k-1] (frames from the start of the chain) with transition names[k-1].
 
     Performance: do NOT put `format=` between the xfades. It makes FFmpeg
     negotiate yuv444p for xfade and auto-insert yuv420p<->yuv444p scalers at
@@ -508,10 +579,10 @@ def xfade_chain(in_labels: List[str], offsets_frames: List[int], s: Settings, ou
     """
     parts = []
     prev = in_labels[0]
-    for k, (label, off) in enumerate(zip(in_labels[1:], offsets_frames), start=1):
+    for k, (label, off, name) in enumerate(zip(in_labels[1:], offsets_frames, names), start=1):
         out = f"xf{k}"
         parts.append(
-            f"[{prev}][{label}]xfade=transition={s.fade_name}:duration={s.fade_dur:.6f}"
+            f"[{prev}][{label}]xfade=transition={name}:duration={s.fade_dur:.6f}"
             f":offset={off / FPS:.6f}[{out}]"
         )
         prev = out
@@ -531,7 +602,6 @@ def build_slideshow_filter(first_slide: int, n_slides: int, s: Settings, out_lab
     only the overlapping tail/head go through xfade, the bodies are
     concatenated untouched (no chroma round trip, so they are also sharper).
     Transition frames are bit-identical to the full-clip xfade chain."""
-    motion = zoom_filters(s) if s.zoom_enabled else hold_filters(s)
     L = s.frames_per_image
     origin = slide_start_frame(first_slide, s)
     starts = [slide_start_frame(first_slide + i, s) - origin for i in range(n_slides)]
@@ -539,14 +609,16 @@ def build_slideshow_filter(first_slide: int, n_slides: int, s: Settings, out_lab
     overlap = [0] + [starts[k - 1] + L - starts[k] for k in range(1, n_slides)]
 
     clip = [
-        f"[{i}:v]format=yuv420p,setsar=1,{motion},format=yuv420p,"
+        f"[{i}:v]format=yuv420p,setsar=1,"
+        f"{zoom_filters(s, first_slide + i) if s.zoom_enabled else hold_filters(s)},format=yuv420p,"
         f"trim=duration={s.seconds_per_image:.6f}"
         for i in range(n_slides)
     ]
+    names = [transition_for(first_slide + k, s) for k in range(1, n_slides)]
     if n_slides > 1 and not all(1 <= ov < L // 2 for ov in overlap[1:]):
         # Degenerate fades (≈0 or longer than half a slide): use the plain chain.
         parts = [f"{c}[v{i}]" for i, c in enumerate(clip)]
-        parts += xfade_chain([f"v{i}" for i in range(n_slides)], starts[1:], s, out_label)
+        parts += xfade_chain([f"v{i}" for i in range(n_slides)], starts[1:], names, s, out_label)
         return ";".join(parts)
 
     def piece(src: str, a: int, b: int, out: str) -> str:
@@ -570,7 +642,7 @@ def build_slideshow_filter(first_slide: int, n_slides: int, s: Settings, out_lab
                 parts.append(piece(f"t{k}s", L - tail, L, f"t{k}"))
         if k > 0:
             parts.append(
-                f"[t{k - 1}][h{k}]xfade=transition={s.fade_name}:duration={s.fade_dur:.6f}:offset=0,"
+                f"[t{k - 1}][h{k}]xfade=transition={names[k - 1]}:duration={s.fade_dur:.6f}:offset=0,"
                 f"format=yuv420p[x{k}]")
             order.append(f"[x{k}]")
         order.append(f"[b{k}]")
@@ -765,6 +837,24 @@ def still_inputs(paths: Sequence[str]) -> List[str]:
     return args
 
 
+def end_screen_filter(seg: Segment, s: Settings) -> str:
+    """Returns ",eq=..." that dims and desaturates the slides from s.end_start on
+    (global time t), or "" when the segment ends before the end screen.
+
+    eq with contrast=k and brightness=-(1-k)/2 scales luma by k (a true dim
+    toward black, not a lift/crush); saturation scales chroma by k as well so
+    colours darken with the image, then loses END_SCREEN_DESATURATE more."""
+    if s.end_start is None or seg.trim_end is None:
+        return ""
+    if seg.start_frame + seg.trim_end - seg.trim_start <= s.end_start * FPS:
+        return ""
+    T, D = s.end_start, s.end_dim
+    p = f"clip((t-{T:.4f})/{END_SCREEN_FADE}\\,0\\,1)"
+    return (f",eq=contrast=1-{D:.3f}*{p}:brightness=-0.5*{D:.3f}*{p}"
+            f":saturation=(1-{D:.3f}*{p})*(1-{END_SCREEN_DESATURATE}*{p})"
+            f":eval=frame:enable=gte(t\\,{T:.4f})")
+
+
 def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
                     x264_threads: Optional[int], title_card: Optional[str] = None,
                     title_card_size=None) -> List[str]:
@@ -781,7 +871,7 @@ def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
     graph = ";".join([
         build_slideshow_filter(seg.first_slide, n, s, out_label="chain"),
         # Shift to global time so the bar animation (which uses t) lines up across segments.
-        f"[chain]{trim},setpts=PTS-STARTPTS+{seg.start_frame}/({FPS}*TB)[slide]",
+        f"[chain]{trim},setpts=PTS-STARTPTS+{seg.start_frame}/({FPS}*TB){end_screen_filter(seg, s)}[slide]",
         build_overlay_filter("slide", logo_index, s),
     ] + ([title_card_filter("outv", card_index, title_card_size, s, "titled")] if use_card else []) + [
         f"[{'titled' if use_card else 'outv'}]setpts=PTS-STARTPTS[seg]",
@@ -834,7 +924,7 @@ def join_segments(seg_paths: List[str], audio: str, out_path: str, tmpdir: str):
         die(f"ffmpeg failed with code {rc}")
 
 
-def render_video(slides: List[str], audio_duration: float, tmpdir: str, s: Settings,
+def render_video(slides: List[str], duration: float, tmpdir: str, s: Settings,
                  max_per_segment: int, workers_override: Optional[int],
                  title_card: Optional[str] = None) -> List[str]:
     """Render all segments; returns their paths in order."""
@@ -852,7 +942,7 @@ def render_video(slides: List[str], audio_duration: float, tmpdir: str, s: Setti
         n_workers = workers_for(cpus, 250 + slides_per_seg * (40 + frame_mb), cpus)
 
     segments = plan_segments(n, segment_count(n, max_per_segment, n_workers),
-                             ceil(audio_duration * FPS), s)
+                             ceil(duration * FPS - 1e-9), s)
     n_workers = min(n_workers, len(segments))
 
     return render_segments(segments, slides, tmpdir, s, n_workers, title_card)
@@ -908,7 +998,11 @@ def parse_args():
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
     p.add_argument("--text-size", type=int, default=114, help="Font size for bottom bar text")
     p.add_argument("--font", default="/Library/Fonts/BebasNeue-Regular.ttf", help="Optional font file path for drawtext")
-    p.add_argument("--fade-name", default="fade", help="FFmpeg xfade transition name (e.g. fade, wipeleft, circleopen)")
+    p.add_argument("--fade-name", default="mix", help="Transition between slides: 'mix' (default; a calm transition picked per slide: " + ", ".join(CALM_TRANSITIONS) + "), one FFmpeg xfade name (e.g. fade, wipeleft, circleopen) or a comma-separated list to pick from")
+    p.add_argument("--motion", default="mix", choices=list(MOTION_POOLS), help="Camera move per slide with --zoom: 'mix' (default; zoom in, zoom out, zoom toward a corner, pan left/right, picked per slide), 'in' (always zoom toward the centre), 'out', 'pan'")
+    p.add_argument("--variation-seed", type=int, default=1, help="Seed for the per-slide motion/transition choice; change it for a different arrangement (default: 1)")
+    p.add_argument("--end-screen", type=float, default=10.0, help="Dim the last N seconds of the video (same length, nothing added) as a calmer background for YouTube end screens (default: 20; 0 disables)")
+    p.add_argument("--end-screen-dim", type=float, default=0.45, help="How much the end-screen slides are darkened, 0-1 (default: 0.45)")
     p.add_argument("--logo", default="", help="Optional logo image path")
     p.add_argument("--title-card", default="", help="Optional title card image (PNG; transparency recommended) shown centred at the start, then shrinking down into the bottom bar")
     p.add_argument("--title-card-duration", type=float, default=6.0, help="Seconds the title card stays fully visible before moving into the bar (default: 4)")
@@ -952,7 +1046,7 @@ def validate_inputs(args):
         die(f"Title card file not found: {args.title_card}")
 
 
-def make_settings(args) -> Settings:
+def make_settings(args, audio_duration: float) -> Settings:
     fade_dur = args.fade_duration
     if fade_dur >= args.seconds_per_image:
         fade_dur = args.seconds_per_image / 2.0
@@ -971,13 +1065,19 @@ def make_settings(args) -> Settings:
         # With a title card the bar rises exactly while the card glides into it.
         bar_delay = args.title_card_duration if args.title_card else 3.0
 
+    transitions = ([t.strip() for t in args.fade_name.split(",") if t.strip()]
+                   if args.fade_name != "mix" else list(CALM_TRANSITIONS))
+    if not transitions:
+        die("--fade-name is empty")
+
     return Settings(
         width=args.width, height=args.height,
-        seconds_per_image=args.seconds_per_image, fade_dur=fade_dur, fade_name=args.fade_name,
+        seconds_per_image=args.seconds_per_image, fade_dur=fade_dur, transitions=tuple(transitions),
         bg_blur=args.blur,
         contrast=args.contrast, saturation=args.saturation, vignette=max(0.0, min(1.0, args.vignette)),
         zoom_enabled=zoom_enabled, zoom_end_percent=args.zoom_end_percent,
         zoom_supersample=args.zoom_supersample,
+        motion=args.motion, variation_seed=args.variation_seed,
         bar_height=args.bar_height, bar_style=args.bar_style, bar_color=args.bar_color,
         bar_alpha=args.bar_alpha, bar_blur=args.bar_blur, bar_tint=args.bar_tint,
         bar_tint_alpha=args.bar_tint_alpha, bar_slide_in_delay=bar_delay,
@@ -986,6 +1086,8 @@ def make_settings(args) -> Settings:
         force_rgba=args.force_rgba,
         title_card=args.title_card, title_card_duration=max(0.0, args.title_card_duration),
         title_card_transition=max(0.0, title_trans),
+        end_start=max(0.0, audio_duration - args.end_screen) if args.end_screen > 0 else None,
+        end_dim=max(0.0, min(1.0, args.end_screen_dim)),
         encoder=resolve_encoder(args.encoder), bitrate=args.bitrate, crf=args.crf, threads=args.threads,
     )
 
@@ -1003,7 +1105,7 @@ def main():
     except Exception as e:
         die(f"Could not determine audio duration: {e}")
 
-    s = make_settings(args)
+    s = make_settings(args, audio_duration)
     needed = slides_needed_for_audio(audio_duration, s.seconds_per_image, s.fade_dur)
     chosen = [images[i % len(images)] for i in range(needed)]
 

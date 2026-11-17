@@ -121,10 +121,12 @@ def _codec_args(out_path: str, bitrate: Optional[str]) -> List[str]:
     return ["-b:a", bitrate] if bitrate else []
 
 
-def convert(in_path: str, out_path: str, bitrate: Optional[str] = None):
-    """Re-encode in_path to the format implied by out_path's extension."""
+def convert(in_path: str, out_path: str, bitrate: Optional[str] = None, af: Optional[str] = None):
+    """Re-encode in_path to the format implied by out_path's extension
+    (optionally through the audio filter chain `af`)."""
     _ffmpeg_stderr(["ffmpeg", "-hide_banner", "-nostats", "-y", "-i", in_path, "-vn",
-                    "-map_metadata", "0"] + _codec_args(out_path, bitrate) + [out_path])
+                    "-map_metadata", "0"] + (["-af", af] if af else [])
+                   + _codec_args(out_path, bitrate) + [out_path])
 
 
 def gain_chain(gain_db: Optional[float], o: EnhanceOptions, sample_rate: int) -> List[str]:
