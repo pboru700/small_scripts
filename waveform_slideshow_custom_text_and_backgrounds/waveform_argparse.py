@@ -31,7 +31,9 @@ Pipeline:
      process reads its slides as single frames (decode + zoom supersampling
      happen once per slide, not per frame), animates and crossfades them,
      adds the bottom bar, text and logo, and encodes with the final settings.
-  3. Join: segments are concatenated without re-encoding and the audio added.
+  3. Audio (optional, on by default): high-pass, optional denoise and loudness
+     normalisation via enhance_audio.py.
+  4. Join: segments are concatenated without re-encoding and the audio added.
 """
 import argparse
 import os
@@ -43,6 +45,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from math import ceil, pi
 from typing import List, Optional, Sequence
+
+import enhance_audio
 
 SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.heic'}
 
@@ -766,14 +770,15 @@ def render_segments(segments: List[Segment], slides: List[str], tmpdir: str, s: 
     return [out for _, _, out in tasks]
 
 
-def join_segments(seg_paths: List[str], audio: str, out_path: str, tmpdir: str):
+def join_segments(seg_paths: List[str], audio: str, out_path: str, tmpdir: str,
+                  audio_bitrate: str = "256k"):
     """Concatenate encoded segments without re-encoding and add the audio track."""
     list_file = os.path.join(tmpdir, "segments.txt")
     with open(list_file, "w") as f:
         for p in seg_paths:
             f.write("file '" + p.replace("'", "'\\''") + "'\n")
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-i", audio,
-           "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", out_path]
+           "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", audio_bitrate, "-shortest", out_path]
     print_cmd("Joining segments + audio", cmd)
     rc = run_streaming(cmd)
     if rc != 0:
@@ -782,7 +787,7 @@ def join_segments(seg_paths: List[str], audio: str, out_path: str, tmpdir: str):
 
 def render_video(slides: List[str], audio: str, audio_duration: float, out_path: str,
                  tmpdir: str, s: Settings, max_per_segment: int, workers_override: Optional[int],
-                 title_card: Optional[str] = None):
+                 title_card: Optional[str] = None, audio_bitrate: str = "256k"):
     n = len(slides)
     cpus = os.cpu_count() or 2
 
@@ -801,7 +806,7 @@ def render_video(slides: List[str], audio: str, audio_duration: float, out_path:
     n_workers = min(n_workers, len(segments))
 
     seg_paths = render_segments(segments, slides, tmpdir, s, n_workers, title_card)
-    join_segments(seg_paths, audio, out_path, tmpdir)
+    join_segments(seg_paths, audio, out_path, tmpdir, audio_bitrate)
 
 
 # --------------------------------------------------------------------------- #
@@ -811,7 +816,7 @@ def render_video(slides: List[str], audio: str, audio_duration: float, out_path:
 def parse_args():
     p = argparse.ArgumentParser(description="Generate a slideshow video from images and an MP3.")
     p.add_argument("--images", required=True, help="Directory containing input images")
-    p.add_argument("--audio", required=True, help="MP3 audio file path")
+    p.add_argument("--audio", required=True, help="Audio file path (WAV, MP3, anything FFmpeg can decode)")
     p.add_argument("--output", required=True, help="Output video file path (e.g. out.mp4)")
     p.add_argument("--width", type=int, default=1920, help="Target video width (default: 1920)")
     p.add_argument("--height", type=int, default=1080, help="Target video height (default: 1080)")
@@ -849,6 +854,12 @@ def parse_args():
     p.add_argument("--force-rgba", action="store_true", help="Force RGBA pixel format for the logo overlay (may slow down; use only if transparency processing explicitly needed).")
     p.add_argument("--max-inputs-per-pass", type=int, default=15, help="Max images per ffmpeg process. The video is always rendered as parallel segments (at least one per CPU core when there are enough images).")
     p.add_argument("--segment-workers", type=int, default=None, help="Parallel workers for segment rendering. Default: auto-sized to CPU cores and available RAM.")
+    a = p.add_argument_group("audio", "Audio clean-up before muxing (see enhance_audio.py)")
+    a.add_argument("--audio-enhance", action=argparse.BooleanOptionalAction, default=True,
+                   help="High-pass + loudness normalisation (+ optional denoise) of the audio track (default: on; --no-audio-enhance uses the file as is)")
+    enhance_audio.add_cli_options(a, prefix="audio-")
+    a.add_argument("--audio-bitrate", default="256k", help="AAC bitrate of the video's audio track (default: 256k)")
+    a.add_argument("--audio-save", default="", help="Also save the processed audio to this file (e.g. for Spotify; .wav/.flac/.mp3/.m4a)")
     return p.parse_args()
 
 
@@ -925,9 +936,22 @@ def main():
         slides = prepare_slides(chosen, tmpdir, s)
         title_card = prepare_title_card(tmpdir, s)
 
+        audio = args.audio
+        if args.audio_enhance:
+            audio = os.path.join(tmpdir, "audio_enhanced.wav")
+            enhance_audio.enhance(args.audio, audio, enhance_audio.options_from_args(args, prefix="audio-"))
+            if args.audio_save:
+                if args.audio_save.lower().endswith(".wav"):
+                    shutil.copyfile(audio, args.audio_save)
+                else:
+                    enhance_audio.convert(audio, args.audio_save)
+                print("Processed audio saved:", args.audio_save)
+        elif args.audio_save:
+            print("Warning: --audio-save ignored with --no-audio-enhance")
+
         max_per_segment = max(2, args.max_inputs_per_pass or len(slides))
-        render_video(slides, args.audio, audio_duration, args.output, tmpdir, s,
-                     max_per_segment, args.segment_workers, title_card)
+        render_video(slides, audio, audio_duration, args.output, tmpdir, s,
+                     max_per_segment, args.segment_workers, title_card, args.audio_bitrate)
 
         print("Done:", args.output)
         print(f"Audio length: {audio_duration:.2f}s, images used: {len(slides)}, resolution: {s.width}x{s.height}")

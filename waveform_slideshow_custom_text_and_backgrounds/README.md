@@ -18,6 +18,7 @@
 - Images loop when the audio is longer than one pass through the folder
 - Hardware encoding on macOS (VideoToolbox), chosen automatically
 - Parallel rendering across all CPU cores
+- Audio clean-up (on by default): rumble high-pass, optional denoise, loudness normalisation to -16 LUFS / -1 dBTP; also available standalone as `enhance_audio.py`
 
 ## Requirements
 - Python 3.9+ (standard library only)
@@ -116,6 +117,18 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 
 Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades out.
 
+### Audio
+| Flag | Default | Description |
+|---|---|---|
+| `--audio-enhance` / `--no-audio-enhance` | on | Process the audio before muxing (see [Audio clean-up](#audio-clean-up-enhance_audiopy)). `--no-audio-enhance` uses the file as is. |
+| `--audio-target-lufs` | `-16` | Integrated loudness target. YouTube and Spotify play at about `-14`. |
+| `--audio-true-peak` | `-1` | True-peak ceiling in dBTP. |
+| `--audio-highpass` | `80` | High-pass cutoff in Hz (24 dB/oct). `0` disables it. |
+| `--audio-denoise` | `off` | `light` / `strong` (FFmpeg `afftdn`) or `rnn` (`arnndn`, needs `--audio-rnn-model`). |
+| `--audio-rnn-model` | none | RNNoise `.rnnn` model, e.g. from [rnnoise-models](https://github.com/GregorR/rnnoise-models). |
+| `--audio-bitrate` | `256k` | AAC bitrate of the video's audio track. |
+| `--audio-save` | none | Also save the processed audio (`.wav`, `.flac`, `.mp3`, `.m4a`), e.g. for a Spotify upload. |
+
 ### Encoding and performance
 | Flag | Default | Description |
 |---|---|---|
@@ -130,9 +143,25 @@ Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades ou
 ## How it works
 1. **Prepare slides (parallel).** For every unique image: a "contain"-scaled foreground and a stretched, blurred background are written as JPEGs. They are then composited once into a lossless slide still, with the color grade and vignette applied. HEIC files are first converted with `sips`. The title card is pre-scaled once.
 2. **Render segments (parallel).** The timeline is split into segments, at least one per worker. Each ffmpeg process reads its slides as single frames, so decoding and zoom supersampling happen once per slide, not once per frame. It then zooms, crossfades, adds the bar, text, logo and (in the first segments only) the title card, and encodes with the final settings. Segment boundaries sit just after a crossfade has finished, so the cuts are invisible.
-3. **Join.** Segments are concatenated without re-encoding (`-c copy`) and the audio is encoded to AAC. The output is cut to the audio length.
+3. **Audio.** Unless `--no-audio-enhance`, the track is cleaned up with `enhance_audio.py` (see below).
+4. **Join.** Segments are concatenated without re-encoding (`-c copy`) and the audio is encoded to AAC (256 kb/s). The output is cut to the audio length.
 
 Slide timing: slide `n` starts fading in at `n × (seconds_per_image − fade_duration)`. If the audio is longer than one pass through the folder, the image list repeats.
+
+## Audio clean-up (`enhance_audio.py`)
+Standalone script (also used by the video script) for spoken-word tracks:
+
+```bash
+python3 enhance_audio.py episode.wav --analyze                    # loudness / true peak / range only
+python3 enhance_audio.py episode.wav episode_master.wav           # -16 LUFS, 24-bit WAV
+python3 enhance_audio.py episode.wav episode.mp3 --target-lufs -14 --denoise light
+```
+
+1. **High-pass** at 80 Hz removes rumble and plosive thumps.
+2. **Denoise** (optional): `light`/`strong` = FFT spectral subtraction (`afftdn`), `rnn` = RNNoise neural model (`arnndn`). Use it only when the background noise is audible; on clean recordings it adds metallic artifacts.
+3. **Loudness**: pass 1 measures EBU R128 loudness (`ebur128`), pass 2 applies one static gain to the target plus a 4×-oversampled limiter at the true-peak ceiling. The limiter only touches the loudest transients, so there is no pumping. If the result is more than 0.3 LU off target, the gain is corrected once.
+
+Output format follows the extension: `.wav`/`.flac` 24-bit lossless, `.mp3` 320 kb/s, `.m4a` AAC 256 kb/s (`--bitrate` overrides). Other flags match the `--audio-*` options above without the prefix, plus `--no-normalize`.
 
 ## Performance notes (Apple Silicon)
 - On a MacBook M2, a 9-minute video with 100 slides at 1080p renders in about 1.5 minutes.
