@@ -1,17 +1,18 @@
 # Slideshow Video Generator
 
-`waveform_argparse.py` builds an MP4 slideshow from a folder of images and an audio track. Each image is scaled to fit a fixed resolution (aspect preserved), placed over a blurred, stretched copy of itself, slowly zoomed toward its center, and crossfaded into the next one. An animated frosted-glass bar with custom text slides in at the bottom, and an optional logo is overlaid. The video lasts as long as the audio; images loop if needed.
+`waveform_argparse.py` builds an MP4 slideshow from a folder of images and an audio track. Each image is scaled to fit a fixed resolution (aspect preserved), placed over a blurred, stretched copy of itself, given a slow camera move (zoom in or out, zoom toward a corner, or a pan), and blended into the next one with a varying calm transition. An animated frosted-glass bar with custom text slides in at the bottom, and an optional logo sits at its left end, glowing softly while someone speaks. The video lasts as long as the audio, with the last 20 s gently dimmed as an end screen; images loop if needed.
 
 ## Features
 - Fixed output resolution (default 1920x1080)
 - "Contain" scaling: no cropping, aspect preserved, small images upscaled
 - Blurred full-frame background made from the same image
-- Slow Ken Burns zoom toward each image's center (on by default, `--no-zoom` to disable), rendered jitter-free via supersampling
-- Crossfade transitions (`xfade`, any FFmpeg transition name)
+- Slow Ken Burns camera move per slide, varied by default: zoom in, zoom out, zoom toward a corner, pan left/right (`--motion`; `--no-zoom` disables), rendered jitter-free via supersampling
+- Calm transitions picked per slide (`fade`, `fadeblack`, `smooth*`, `circleopen`, `hblur`), or any fixed FFmpeg `xfade` transition (`--fade-name`)
+- End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`); the length does not change
 - Bottom bar with centered text that slides up, stays visible, then slides away
   - `blur` style: frosted glass with optional color tint
   - `solid` style: flat semi-transparent color
-- Optional logo, bottom-left
+- Optional logo (`--logo`) at the left end of the bar (vertically centred on it, sized to fit inside), reacting to the voice: soft glow (default), pulse or ring; transparent margins trimmed automatically
 - Optional title card (PNG): shown at the start, then glides down and shrinks into the bar, crossfading into the bar text
 - Light color grade: a bit more contrast and saturation plus a soft vignette (on by default, baked into each slide, so it costs no render time)
 - HEIC/HEIF support (decoded with macOS `sips`)
@@ -71,7 +72,8 @@ python3 waveform_argparse.py \
 |---|---|---|
 | `--seconds-per-image` | `6` | Time each image is on screen, including its fade-out. |
 | `--fade-duration` | `0.5` | Crossfade length. Reduced to half of `--seconds-per-image` if it is too long. |
-| `--fade-name` | `fade` | FFmpeg `xfade` transition (`fade`, `wipeleft`, `circleopen`, …). |
+| `--fade-name` | `mix` | Transition between slides. `mix` picks a calm one per slide (never twice in a row): `fade`, `fadeblack`, `smoothleft`, `smoothright`, `smoothup`, `smoothdown`, `circleopen`, `hblur`. Can also be one FFmpeg `xfade` name (`fade`, `wipeleft`, …) or a comma-separated list to pick from (`fade,fadeblack`). |
+| `--variation-seed` | `1` | Seed for the per-slide choice of transitions and camera moves. The same seed gives the same video; change it for a different arrangement. |
 | `--blur` | `10` | Background blur radius (boxblur). |
 
 ### Look
@@ -86,8 +88,9 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 ### Zoom
 | Flag | Default | Description |
 |---|---|---|
-| `--zoom` / `--no-zoom` | on | Slow zoom toward the image center during its display time. |
-| `--zoom-end-percent` | `105` | Image scale on its last frame (`100` = no zoom, `110` = 10% closer). Values `<= 100` disable the zoom. |
+| `--zoom` / `--no-zoom` | on | Slow camera move during each slide's display time. |
+| `--motion` | `mix` | `mix`: per slide one of zoom in, zoom out, zoom toward a corner, pan left, pan right (never the same twice in a row). `in`: always zoom toward the center (the old behaviour). `out`: always zoom out. `pan`: only pans. |
+| `--zoom-end-percent` | `105` | Image scale at the most zoomed-in point (`100` = no zoom, `110` = 10% closer). Pans run at this scale. Values `<= 100` disable the camera moves. |
 | `--zoom-supersample` | `6` | The zoom crops in whole pixels, which at slow speeds looks like a 1px jitter. Cropping from an enlarged frame shrinks the step to `1/factor` px. Capped so the enlarged frame is at most 7680 px wide, so at 1080p the effective value is 4. Lower (1–2) renders faster; higher means smoother motion and more memory. |
 
 ### Bottom bar and text
@@ -103,10 +106,12 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 | `--bar-slide-in-delay` | `3` | Seconds before the bar slides up. With `--title-card` the default is `--title-card-duration`, so the bar rises while the card glides into it. |
 | `--bar-visible-duration` | `30` | Seconds the bar stays fully visible before sliding down. |
 | `--bar-slide-duration` | `1` | Length of each slide animation. `0` keeps the bar static for the whole video. |
-| `--text` | empty | Text centered in the bar (color `#ffb000`). |
+| `--text` | empty | Text centered in the bar (color `#ffb000` with a 6 px black outline). |
 | `--text-size` | `114` | Font size. |
 | `--font` | `/Library/Fonts/BebasNeue-Regular.ttf` | Font file for the text. |
-| `--logo` | none | Logo image, scaled to 105x105, placed bottom-left. Transparency is kept. |
+| `--logo` | none | Logo image (PNG with transparency recommended). Transparent margins are trimmed automatically. It is centred vertically on the bar (at its resting position) at the left edge. Empty or a missing file: no logo (a missing file prints a warning). |
+| `--logo-effect` | `glow` | How the logo reacts to the voice. `glow`: a soft orange (`#ff5800`) glow behind the logo lights up while someone speaks. `pulse`: the logo grows by up to 4%. `ring`: a thin orange (`#ff5800`) ring around the logo widens and brightens. `none`: static logo. The reaction follows phrases, not syllables (fast rise, ~0.45 s fall), and rests in pauses. |
+| `--logo-size` | bar height − 20 | Longest side of the logo in px. The default (100 px for a 120 px bar) keeps the logo and its effect inside the bar. Without a bar: 105 px in the bottom-left corner. |
 
 ### Title card
 | Flag | Default | Description |
@@ -116,6 +121,12 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 | `--title-card-transition` | `--bar-slide-duration` | Seconds the card takes to shrink and glide into the bar. In the last 30% of the glide it fades out while the bar text fades in. After that the card is gone for good. |
 
 Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades out.
+
+### End screen
+| Option | Default | Description |
+|---|---|---|
+| `--end-screen` | `20` | The last N seconds of the video are dimmed and slightly desaturated (fading in over 1.5 s), as a calmer background for YouTube end-screen elements (YouTube allows 5–20 s). The video length and audio are unchanged. `0` disables. |
+| `--end-screen-dim` | `0.45` | How much darker the slides get at the end (`0.45` = 45% darker; `0`–`1`). |
 
 ### Audio
 | Flag | Default | Description |
