@@ -11,6 +11,7 @@
 - End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`), while the corner logo slides down off the screen; the length does not change
 - Bottom bar with centered text that slides up, stays visible, then slides away
   - `blur` style: frosted glass with optional color tint
+  - `glass` style: floating Liquid Glass capsule — the image bends around its rim (lens refraction), mostly clear with a light blur and a saturation boost, a specular edge highlight and a soft drop shadow
   - `solid` style: flat semi-transparent color
 - Optional logo (`--logo`) at the left end of the bar (vertically centred on it, sized to fit inside), reacting to the voice: soft glow (default), pulse or ring; transparent margins trimmed automatically
 - Optional title card (PNG): shown at the start, then glides down and shrinks into the bar, crossfading into the bar text
@@ -97,10 +98,15 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 | Flag | Default | Description |
 |---|---|---|
 | `--bar-height` | `120` | Bar height in px. `0` disables the bar and text. |
-| `--bar-style` | `blur` | `blur` (frosted glass) or `solid` (flat color). |
+| `--bar-style` | `blur` | `blur` (frosted glass), `glass` (Liquid Glass capsule) or `solid` (flat color). |
 | `--bar-blur` | `20` | Blur radius for the `blur` style. |
 | `--bar-tint` | `#00464a` | Tint over the blurred bar. Empty string disables it. |
 | `--bar-tint-alpha` | `0.6` | Tint opacity. |
+| `--glass-inset` | `16` | `glass` style: gap between the capsule and the left/right/bottom frame edges (px). The capsule is `--bar-height` − inset tall; the logo and title card centre on it. |
+| `--glass-radius` | `0` | `glass` style: corner radius in px. `0` = capsule (fully rounded ends). |
+| `--glass-refraction` | `28` | `glass` style: lens strength — how far (px) the rim bends the image from outside the capsule into it. `0` disables refraction. |
+| `--glass-blur` | `4` | `glass` style: gaussian blur (sigma) of the content seen through the glass. |
+| `--glass-tint-alpha` | `0.25` | `glass` style: opacity of `--bar-tint` over the glass. |
 | `--bar-color` | `#00464a` | Color for the `solid` style. |
 | `--bar-alpha` | `0.7` | Opacity for the `solid` style. |
 | `--bar-slide-in-delay` | `3` | Seconds before the bar slides up. With `--title-card` the default is `--title-card-duration`, so the bar rises while the card glides into it. |

@@ -45,7 +45,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
-from math import ceil, pi
+from math import ceil, exp, hypot, pi
 from typing import List, Optional, Sequence
 
 import enhance_audio
@@ -77,6 +77,14 @@ TEXT_BORDER = 6                       # black outline around the bar text (px)
 # fraction of the bar height it shrinks to when it lands in the bar.
 TITLE_CARD_FILL = 1.0
 TITLE_CARD_LANDED_HEIGHT = 0.8
+
+# Liquid glass bar (--bar-style glass): saturation boost of the refracted
+# content, light direction of the specular rim (x, y; screen y points down)
+# and the soft drop shadow (spread px, y offset px, opacity).
+GLASS_SATURATION = 1.35
+GLASS_BRIGHTNESS = 0.03
+GLASS_LIGHT = (-0.45, -0.89)
+GLASS_SHADOW = (22, 5, 0.30)
 
 # --fade-name mix: calm transitions picked per slide (never the same twice in a row).
 CALM_TRANSITIONS = ("fade", "fadeblack", "smoothleft", "smoothright", "smoothup",
@@ -134,6 +142,11 @@ class Settings:
     bar_slide_in_delay: float
     bar_visible_duration: float
     bar_slide_duration: float
+    glass_inset: int            # glass: gap to the left/right/bottom frame edges (px)
+    glass_radius: int           # glass: corner radius (px), 0 = capsule
+    glass_refraction: int       # glass: max lens displacement at the edge (px)
+    glass_blur: float           # glass: gblur sigma of the content seen through it
+    glass_tint_alpha: float     # glass: opacity of --bar-tint over the glass
     text: str
     text_size: int
     font: str
@@ -158,6 +171,19 @@ class Settings:
     def bar_top(self) -> int:
         """y of the bar's top edge when fully visible."""
         return self.height - self.bar_height
+
+    @property
+    def glass_rect(self):
+        """(x, y, w, h) of the glass bar at rest (y = bar_top)."""
+        i = self.glass_inset
+        return i, self.bar_top, self.width - 2 * i, self.bar_height - i
+
+    @property
+    def bar_center_y(self) -> float:
+        """Vertical centre of the visible bar at rest (logo / title card target)."""
+        if self.bar_style == "glass":
+            return self.bar_top + self.glass_rect[3] / 2
+        return self.height - self.bar_height / 2
 
     @property
     def supersample(self) -> int:
@@ -682,7 +708,7 @@ def title_card_filter(src_label: str, card_index: int, card_size, s: Settings, o
     p = f"clip((t-{hold:.4f})/{trans:.4f}\\,0\\,1)"
     e = f"({p})*({p})*(3-2*({p}))"
     z = f"(1-(1-{end_scale:.6f})*{e})"
-    cy_end = s.height - bar_h / 2
+    cy_end = s.bar_center_y if s.bar_height > 0 else s.height - bar_h / 2
     cy = f"({s.height / 2:.2f}+({cy_end:.2f}-{s.height / 2:.2f})*{e})"
     fade_start, fade_dur = title_handoff(s)
     return (
@@ -694,7 +720,153 @@ def title_card_filter(src_label: str, card_index: int, card_size, s: Settings, o
     )
 
 
-def build_overlay_filter(slide_label: str, s: Settings) -> str:
+# --------------------------------------------------------------------------- #
+# Liquid glass bar
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class Glass:
+    """Precomputed still layers of the glass bar (generated once, read as
+    single-frame inputs by every segment)."""
+    inputs: tuple   # xmap, ymap, rim (rgba), mask (gray), shadow (rgba)
+    region: tuple   # (x, y, w, h) of the captured background around the glass
+
+
+def _rrect_sdf(px: float, py: float, hw: float, hh: float, r: float):
+    """Signed distance of (px, py) (relative to the centre) to a rounded
+    rectangle with half sizes hw x hh and corner radius r (negative inside),
+    plus the outward unit normal."""
+    sx, sy = (1 if px >= 0 else -1), (1 if py >= 0 else -1)
+    qx, qy = abs(px) - hw + r, abs(py) - hh + r
+    if qx > 0 and qy > 0:
+        L = hypot(qx, qy)
+        return L - r, (sx * qx / L, sy * qy / L)
+    if qx > qy:
+        return qx - r, (sx, 0.0)
+    return qy - r, (0.0, sy)
+
+
+def _write_pgm(path: str, w: int, h: int, data: bytearray):
+    with open(path, "wb") as f:
+        f.write(f"P5\n{w} {h}\n255\n".encode() + bytes(data))
+
+
+def _write_pam_rgba(path: str, w: int, h: int, data: bytearray):
+    with open(path, "wb") as f:
+        f.write(f"P7\nWIDTH {w}\nHEIGHT {h}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n".encode()
+                + bytes(data))
+
+
+def prepare_glass(tmpdir: str, s: Settings) -> Optional[Glass]:
+    """Builds the glass layers (pure Python, ~1 s at 1080p):
+      - xmap/ymap for ffmpeg's displace: towards the rim the glass samples the
+        background further *outside* the shape (a convex lens edge), so the
+        image bends around the border like Apple's Liquid Glass
+      - rim: thin specular edge (bright where it faces the light, a fainter
+        counter-highlight opposite) + a soft inner glow
+      - mask: antialiased rounded-rectangle alpha
+      - shadow: soft drop shadow that makes the bar float"""
+    if s.bar_height <= 0 or s.bar_style != "glass":
+        return None
+    W, H = s.width, s.height
+    gx, gy, gw, gh = s.glass_rect
+    if gw < 8 or gh < 8:
+        die("--bar-style glass: the bar is too small for --glass-inset")
+    r = min(s.glass_radius or gh / 2, gh / 2, gw / 2)
+    hw, hh = gw / 2, gh / 2
+    P = max(0, s.glass_refraction)
+
+    # captured region: the glass plus up to P px around it (clipped to the frame)
+    rx0, ry0 = max(0, gx - P), max(0, gy - P)
+    rx1, ry1 = min(W, gx + gw + P), min(H, gy + gh + P)
+    RW, RH = rx1 - rx0, ry1 - ry0
+    bevel = max(6.0, min(r, hh) * 0.9)
+    xmap, ymap = bytearray([128]) * (RW * RH), bytearray([128]) * (RW * RH)
+    for y in range(gy, gy + gh):
+        py = y + 0.5 - (gy + hh)
+        row = (y - ry0) * RW - rx0
+        for x in range(gx, gx + gw):
+            d, (nx, ny) = _rrect_sdf(x + 0.5 - (gx + hw), py, hw, hh, r)
+            if d >= 0 or -d >= bevel:
+                continue
+            m = P * (1 + d / bevel) ** 2           # P at the rim -> 0 at the bevel's inner edge
+            xmap[row + x] = max(0, min(255, round(128 + nx * m)))
+            ymap[row + x] = max(0, min(255, round(128 + ny * m)))
+
+    lx, ly = GLASS_LIGHT
+    rim, mask = bytearray(gw * gh * 4), bytearray(gw * gh)
+    for y in range(gh):
+        py = y + 0.5 - hh
+        for x in range(gw):
+            d, (nx, ny) = _rrect_sdf(x + 0.5 - hw, py, hw, hh, r)
+            i = y * gw + x
+            mask[i] = max(0, min(255, round((0.5 - d) * 255)))
+            if d > 0.5:
+                continue
+            u = -d                                  # depth inside the glass
+            facing = nx * lx + ny * ly
+            spec = 0.25 + 0.75 * max(0.0, facing) ** 2 + 0.45 * max(0.0, -facing) ** 2
+            line = max(0.0, 1 - abs(u - 1.2) / 1.4) * min(1.0, spec) * 0.95
+            glow = exp(-u / 7) * 0.22 * spec
+            sheen = 0.07 * max(0.0, 1 - (y + 0.5) / (gh * 0.55))
+            a = 1 - (1 - line) * (1 - glow) * (1 - sheen)
+            rim[4 * i:4 * i + 4] = b"\xff\xff\xff" + bytes([round(255 * min(1.0, a))])
+
+    S, off, opacity = GLASS_SHADOW
+    sw, sh = gw + 2 * S, gh + 2 * S
+    shadow = bytearray(sw * sh * 4)
+    for y in range(sh):
+        py = y + 0.5 - S - off - hh
+        for x in range(sw):
+            d, _ = _rrect_sdf(x + 0.5 - S - hw, py, hw, hh, r)
+            t = min(1.0, max(0.0, d / S + 0.25))
+            a = opacity * (1 - t * t * (3 - 2 * t))
+            shadow[4 * (y * sw + x) + 3] = round(255 * a)
+
+    paths = [os.path.join(tmpdir, n) for n in
+             ("glass_xmap.pgm", "glass_ymap.pgm", "glass_rim.pam", "glass_mask.pgm", "glass_shadow.pam")]
+    _write_pgm(paths[0], RW, RH, xmap)
+    _write_pgm(paths[1], RW, RH, ymap)
+    _write_pam_rgba(paths[2], gw, gh, rim)
+    _write_pgm(paths[3], gw, gh, mask)
+    _write_pam_rgba(paths[4], sw, sh, shadow)
+    return Glass(inputs=tuple(paths), region=(rx0, ry0, RW, RH))
+
+
+def glass_bar_filter(src: str, s: Settings, glass: Glass, i0: int) -> List[str]:
+    """[src] -> [slide_bar] with the liquid glass bar. The glass is cut from the
+    bar's resting position (like the blur style) and slides in with overlay;
+    the rim, text and mask move with it."""
+    gx, gy, gw, gh = s.glass_rect
+    rx, ry, RW, RH = glass.region
+    S, off, _ = GLASS_SHADOW
+    bar_y = bar_y_expr(s)
+    # everything goes through planar RGB so displace treats all planes alike
+    chain = f"[glsrc]crop={RW}:{RH}:{rx}:{ry},format=gbrp"
+    if s.glass_blur > 0:
+        chain += f",gblur=sigma={s.glass_blur:.2f}"
+    chain += (f"[glbg];[{i0}:v]format=gbrp,loop=-1:1[gx];[{i0 + 1}:v]format=gbrp,loop=-1:1[gy];"
+              f"[glbg][gx][gy]displace=edge=smear,crop={gw}:{gh}:{gx - rx}:{gy - ry},"
+              f"eq=saturation={GLASS_SATURATION}:brightness={GLASS_BRIGHTNESS},format=rgba")
+    if s.bar_tint and s.glass_tint_alpha > 0:
+        chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={s.bar_tint}@{s.glass_tint_alpha:.3f}:t=fill"
+    chain += f"[gltint];[{i0 + 2}:v]format=rgba,loop=-1:1[glrim];[gltint][glrim]overlay=format=auto"
+    if s.text:
+        chain += ",drawtext=" + build_drawtext_options(
+            s.text, s.text_size, s.font, "(h-text_h)/2", bar_text_alpha(s))
+    chain += (f",format=rgba[gltxt];[{i0 + 3}:v]format=gray,loop=-1:1[glmask];"
+              f"[gltxt][glmask]alphamerge[glass];"
+              f"[{i0 + 4}:v]format=rgba,loop=-1:1[glshadow]")
+    return [
+        f"{src}split=2[base][glsrc]",
+        chain,
+        f"[base][glshadow]overlay=x={gx - S}:y={bar_y}-{S - off}:format=auto:shortest=1[glbase]",
+        f"[glbase][glass]overlay=x={gx}:y={bar_y}:format=auto:shortest=1,format=yuv420p[slide_bar]",
+    ]
+
+
+def build_overlay_filter(slide_label: str, s: Settings, glass: Optional[Glass] = None,
+                         glass_input: int = 0) -> str:
     """Adds the animated bottom bar (+text) to [slide_label] -> [slide_bar]."""
     parts = []
     src = f"[{slide_label}]"
@@ -703,6 +875,8 @@ def build_overlay_filter(slide_label: str, s: Settings) -> str:
 
     if bar_h <= 0:
         parts.append(f"{src}copy[slide_bar]")
+    elif s.bar_style == "glass":
+        parts += glass_bar_filter(src, s, glass, glass_input)
     elif s.bar_style == "solid":
         color = f"{s.bar_color or '#000000'}@{s.bar_alpha:.3f}"
         chain = f"{src}drawbox=x=0:y={bar_y}:w=iw:h={bar_h}:color={color}:t=fill"
@@ -922,7 +1096,11 @@ def prepare_logo(tmpdir: str, s: Settings, audio: str, n_frames: int) -> Optiona
     # room around it for the ring (1.2x the logo).
     room = max(w, h) * 0.6
     cx = LOGO_MARGIN + room
-    cy = s.height - s.bar_height / 2 if s.bar_height > 0 else s.height - LOGO_MARGIN - room
+    if s.bar_height > 0 and s.bar_style == "glass":
+        # centre of the capsule's rounded left end
+        gx, _, gw, gh = s.glass_rect
+        cx = max(cx, gx + min(gh / 2, gw / 2))
+    cy = s.bar_center_y if s.bar_height > 0 else s.height - LOGO_MARGIN - room
 
     def make(name: str, vf: str, inp: Optional[List[str]] = None) -> str:
         out = os.path.join(tmpdir, name)
@@ -1056,13 +1234,15 @@ def end_screen_filter(seg: Segment, s: Settings) -> str:
 
 def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
                     x264_threads: Optional[int], title_card: Optional[str] = None,
-                    title_card_size=None, logo: Optional[Logo] = None) -> List[str]:
+                    title_card_size=None, logo: Optional[Logo] = None,
+                    glass: Optional[Glass] = None) -> List[str]:
     seg_slides = slides[seg.first_slide:seg.last_slide + 1]
     n = len(seg_slides)
     logo_inputs = list(logo.inputs) if logo else []
     # The card only goes into segments that start before it has disappeared.
     use_card = bool(title_card) and seg.start_frame < s.title_card_end * FPS
     card_index = n + len(logo_inputs)
+    glass_index = card_index + (1 if use_card else 0)
 
     trim = f"trim=start_frame={seg.trim_start}"
     if seg.trim_end is not None:
@@ -1071,7 +1251,7 @@ def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
         build_slideshow_filter(seg.first_slide, n, s, out_label="chain"),
         # Shift to global time so the bar animation (which uses t) lines up across segments.
         f"[chain]{trim},setpts=PTS-STARTPTS+{seg.start_frame}/({FPS}*TB){end_screen_filter(seg, s)}[slide]",
-        build_overlay_filter("slide", s),
+        build_overlay_filter("slide", s, glass, glass_index),
         logo_filter(seg, logo, n, s) if logo else "[slide_bar]setsar=1[outv]",
     ] + ([title_card_filter("outv", card_index, title_card_size, s, "titled")] if use_card else []) + [
         f"[{'titled' if use_card else 'outv'}]setpts=PTS-STARTPTS[seg]",
@@ -1080,6 +1260,8 @@ def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
     if use_card:
         cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{s.title_card_end + 1 / FPS:.4f}",
                 "-i", title_card]
+    if glass:
+        cmd += still_inputs(glass.inputs)
     cmd += ["-filter_complex", graph, "-map", "[seg]", "-an"]
     cmd += encoder_args(s, x264_threads) + ["-pix_fmt", "yuv420p", out_path]
     return cmd
@@ -1087,13 +1269,13 @@ def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
 
 def render_segments(segments: List[Segment], slides: List[str], tmpdir: str, s: Settings,
                     n_workers: int, title_card: Optional[str] = None,
-                    logo: Optional[Logo] = None) -> List[str]:
+                    logo: Optional[Logo] = None, glass: Optional[Glass] = None) -> List[str]:
     x264_threads = s.threads or max(1, (os.cpu_count() or 1) // n_workers)
     card_size = probe_image_size(title_card) if title_card else None
     tasks = []
     for seg in segments:
         out = os.path.join(tmpdir, f"segment_{seg.index:03d}.mp4")
-        cmd = segment_command(seg, slides, out, s, x264_threads, title_card, card_size, logo)
+        cmd = segment_command(seg, slides, out, s, x264_threads, title_card, card_size, logo, glass)
         tasks.append((seg.index, cmd, out))
 
     print(f"Rendering {len(tasks)} segments with {n_workers} parallel workers...")
@@ -1125,7 +1307,8 @@ def join_segments(seg_paths: List[str], audio: str, out_path: str, tmpdir: str):
 
 def render_video(slides: List[str], duration: float, tmpdir: str, s: Settings,
                  max_per_segment: int, workers_override: Optional[int],
-                 title_card: Optional[str] = None, logo: Optional[Logo] = None) -> List[str]:
+                 title_card: Optional[str] = None, logo: Optional[Logo] = None,
+                 glass: Optional[Glass] = None) -> List[str]:
     """Render all segments; returns their paths in order."""
     n = len(slides)
     cpus = os.cpu_count() or 2
@@ -1144,7 +1327,7 @@ def render_video(slides: List[str], duration: float, tmpdir: str, s: Settings,
                              ceil(duration * FPS - 1e-9), s)
     n_workers = min(n_workers, len(segments))
 
-    return render_segments(segments, slides, tmpdir, s, n_workers, title_card, logo)
+    return render_segments(segments, slides, tmpdir, s, n_workers, title_card, logo, glass)
 
 
 def prepare_audio(args, tmpdir: str) -> str:
@@ -1182,12 +1365,17 @@ def parse_args():
     p.add_argument("--seconds-per-image", type=float, default=6.0, help="Seconds each image remains before transition")
     p.add_argument("--fade-duration", type=float, default=0.5, help="Crossfade transition duration in seconds")
     p.add_argument("--bar-height", type=int, default=120, help="Height of bottom bar")
-    p.add_argument("--bar-style", default="blur", choices=["blur", "solid"], help="Bottom bar style: 'blur' (frosted glass with optional tint) or 'solid' (flat alpha color)")
+    p.add_argument("--bar-style", default="blur", choices=["blur", "glass", "solid"], help="Bottom bar style: 'blur' (frosted glass with optional tint), 'glass' (floating Liquid Glass capsule: edge refraction, specular rim, shadow) or 'solid' (flat alpha color)")
     p.add_argument("--bar-color", default="#00464a", help="Bar color for --bar-style solid (hex, e.g. #000000)")
     p.add_argument("--bar-alpha", type=float, default=0.7, help="Bar opacity for --bar-style solid (0.0 - 1.0)")
     p.add_argument("--bar-blur", type=int, default=20, help="Blur radius for --bar-style blur (boxblur radius)")
     p.add_argument("--bar-tint", default="#00464a", help="Tint color overlaid on the blurred bar for --bar-style blur (hex). Empty string disables tint.")
     p.add_argument("--bar-tint-alpha", type=float, default=0.6, help="Opacity of the bar tint for --bar-style blur (0.0 - 1.0)")
+    p.add_argument("--glass-inset", type=int, default=16, help="--bar-style glass: gap between the glass and the left/right/bottom frame edges in px (default: 16)")
+    p.add_argument("--glass-radius", type=int, default=0, help="--bar-style glass: corner radius in px (default: 0 = capsule, fully rounded ends)")
+    p.add_argument("--glass-refraction", type=int, default=28, help="--bar-style glass: lens strength = max displacement at the rim in px, 0 disables (default: 28)")
+    p.add_argument("--glass-blur", type=float, default=4.0, help="--bar-style glass: blur (gaussian sigma) of the content seen through the glass; Liquid Glass is mostly clear (default: 4)")
+    p.add_argument("--glass-tint-alpha", type=float, default=0.25, help="--bar-style glass: opacity of --bar-tint over the glass (default: 0.25)")
     p.add_argument("--bar-slide-in-delay", type=float, default=None, help="Seconds before the bar slides up into view (default: 3, or --title-card-duration when a title card is used)")
     p.add_argument("--bar-visible-duration", type=float, default=30.0, help="Seconds the bar remains visible before sliding back down (default: 30)")
     p.add_argument("--bar-slide-duration", type=float, default=1.0, help="Duration of each slide animation in seconds, both in and out (default: 1)")
@@ -1249,6 +1437,13 @@ def validate_inputs(args):
         die(f"Title card file not found: {args.title_card}")
 
 
+def default_logo_size(args) -> int:
+    """Bar height - 20 (the glass capsule is shorter by --glass-inset), so the
+    logo and its effect stay inside the bar; LOGO_SIZE without a bar."""
+    inner = args.bar_height - (max(0, args.glass_inset) if args.bar_style == "glass" else 0)
+    return inner - 20 if inner > 40 else LOGO_SIZE
+
+
 def make_settings(args, audio_duration: float) -> Settings:
     fade_dur = args.fade_duration
     if fade_dur >= args.seconds_per_image:
@@ -1285,9 +1480,12 @@ def make_settings(args, audio_duration: float) -> Settings:
         bar_alpha=args.bar_alpha, bar_blur=args.bar_blur, bar_tint=args.bar_tint,
         bar_tint_alpha=args.bar_tint_alpha, bar_slide_in_delay=bar_delay,
         bar_visible_duration=args.bar_visible_duration, bar_slide_duration=args.bar_slide_duration,
+        glass_inset=max(0, args.glass_inset), glass_radius=max(0, args.glass_radius),
+        glass_refraction=max(0, min(127, args.glass_refraction)), glass_blur=max(0.0, args.glass_blur),
+        glass_tint_alpha=max(0.0, min(1.0, args.glass_tint_alpha)),
         text=args.text, text_size=args.text_size, font=args.font, logo=args.logo,
         logo_effect=args.logo_effect,
-        logo_size=args.logo_size if args.logo_size > 0 else (args.bar_height - 20 if args.bar_height > 40 else LOGO_SIZE),
+        logo_size=args.logo_size if args.logo_size > 0 else default_logo_size(args),
         force_rgba=args.force_rgba,
         title_card=args.title_card, title_card_duration=max(0.0, args.title_card_duration),
         title_card_transition=max(0.0, title_trans),
@@ -1320,13 +1518,14 @@ def main():
             logo_job = logo_pool.submit(prepare_logo, tmpdir, s, args.audio, ceil(audio_duration * FPS))
             slides = prepare_slides(chosen, tmpdir, s)
             title_card = prepare_title_card(tmpdir, s)
+            glass = prepare_glass(tmpdir, s)
             logo = logo_job.result()
 
         max_per_segment = max(2, args.max_inputs_per_pass or len(slides))
         with ThreadPoolExecutor(max_workers=1) as audio_pool:
             audio_job = audio_pool.submit(prepare_audio, args, tmpdir)
             seg_paths = render_video(slides, audio_duration, tmpdir, s, max_per_segment,
-                                     args.segment_workers, title_card, logo)
+                                     args.segment_workers, title_card, logo, glass)
             audio_track = audio_job.result()
         join_segments(seg_paths, audio_track, args.output, tmpdir)
 
