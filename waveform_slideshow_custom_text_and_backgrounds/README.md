@@ -137,14 +137,16 @@ Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades ou
 | `--crf` | `18` | Quality for libx264 (lower = better). For `vt_h264` without a bitrate it is mapped to `-q:v`. |
 | `--threads` | auto | libx264 threads per process. |
 | `--max-inputs-per-pass` | `15` | Maximum number of images per ffmpeg process (segment). Lower it to reduce memory use. |
-| `--segment-workers` | auto | Number of segments rendered in parallel. By default it is sized to the CPU cores and free RAM. |
+| `--segment-workers` | 0 (auto) | Number of segments rendered in parallel. `0` sizes it automatically to the CPU cores and free RAM. |
 | `--force-rgba` | off | Use RGBA for the logo overlay. Only needed for special transparency cases. |
 
 ## How it works
 1. **Prepare slides (parallel).** For every unique image: a "contain"-scaled foreground and a stretched, blurred background are written as JPEGs. They are then composited once into a lossless slide still, with the color grade and vignette applied. HEIC files are first converted with `sips`. The title card is pre-scaled once.
 2. **Render segments (parallel).** The timeline is split into segments, at least one per worker. Each ffmpeg process reads its slides as single frames, so decoding and zoom supersampling happen once per slide, not once per frame. It then zooms, crossfades, adds the bar, text, logo and (in the first segments only) the title card, and encodes with the final settings. Segment boundaries sit just after a crossfade has finished, so the cuts are invisible.
 3. **Audio.** Unless `--no-audio-enhance`, the track is cleaned up with `enhance_audio.py` (see below).
-4. **Join.** Segments are concatenated without re-encoding (`-c copy`) and the audio is encoded to AAC (256 kb/s). The output is cut to the audio length.
+4. **Join.** Segments are concatenated without re-encoding (`-c copy`) together with the audio track. The output is cut to the audio length.
+
+The audio (clean-up, saving `_enhanced`, AAC 256 kb/s encoding) is processed in a background thread while the segments render, so it adds no time. On macOS the AAC encoder is Apple's AudioToolbox (`aac_at`), which is ~6x faster than FFmpeg's built-in `aac`.
 
 Slide timing: slide `n` starts fading in at `n × (seconds_per_image − fade_duration)`. If the audio is longer than one pass through the folder, the image list repeats.
 
@@ -165,7 +167,8 @@ Output format follows the extension: `.wav`/`.flac` 24-bit lossless, `.mp3` 320 
 
 ## Performance notes (Apple Silicon)
 - On a MacBook M2, a 9-minute video with 100 slides at 1080p renders in about 1.5 minutes.
-- The hardware H.264/HEVC encoder is one shared unit (~200 fps at 1080p on M2). Parallel sessions split that throughput, so encoding time is the practical lower bound. This is why every frame is encoded only once.
+- The hardware H.264/HEVC encoder is one shared unit (~200 fps at 1080p on M2). Parallel sessions split that throughput, so encoding time is the practical lower bound. This is why every frame is encoded only once. Render time therefore scales with the frame count: 30 fps takes about 20% longer than 25 fps.
+- Only the frames of each transition go through `xfade` (it works in 4:4:4 only, so every frame passing through it is converted 4:2:0 → 4:4:4 → 4:2:0). The rest of each slide is concatenated directly, which saves ~15–45% of the CPU and keeps the colours slightly sharper.
 - Each segment process needs about 1–1.3 GB of RAM with zoom at 1080p. If you have spare memory, `--segment-workers 8` can be ~10% faster than the cautious automatic choice.
 - `--zoom-supersample 2` or `--no-zoom` cut CPU time a lot. `--encoder x264` uses the CPU instead of the media engine: slower, but with exact CRF control.
 

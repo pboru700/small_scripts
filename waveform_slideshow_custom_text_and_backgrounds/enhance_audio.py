@@ -117,7 +117,7 @@ def _codec_args(out_path: str, bitrate: Optional[str]) -> List[str]:
     if ext == ".mp3":
         return ["-c:a", "libmp3lame", "-b:a", bitrate or "320k"]
     if ext in (".m4a", ".aac", ".mp4"):
-        return ["-c:a", "aac", "-b:a", bitrate or "256k"]
+        return ["-c:a", aac_encoder(), "-b:a", bitrate or "256k"]
     return ["-b:a", bitrate] if bitrate else []
 
 
@@ -201,6 +201,17 @@ def enhance(in_path: str, out_path: str, o: EnhanceOptions,
 
 
 _SOXR = None
+_AAC = None
+
+
+def aac_encoder() -> str:
+    """Apple's AudioToolbox AAC encoder when available (macOS): ~6x faster than
+    FFmpeg's native `aac` and at least as good at 256k; native `aac` elsewhere."""
+    global _AAC
+    if _AAC is None:
+        res = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
+        _AAC = "aac_at" if re.search(r"^\s*A\S*\s+aac_at\s", res.stdout, re.M) else "aac"
+    return _AAC
 
 
 def _has_soxr() -> bool:

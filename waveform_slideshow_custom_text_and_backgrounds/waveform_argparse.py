@@ -50,8 +50,8 @@ import enhance_audio
 
 SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.heic'}
 
-# Frame rate of the whole pipeline (matches FFmpeg's image2 default of 25 fps).
-FPS = 25
+# Frame rate of the whole pipeline.
+FPS = 30
 
 # Supersampled frames for the zoom stage are capped at this width.
 MAX_SUPERSAMPLE_WIDTH = 7680
@@ -521,16 +521,65 @@ def xfade_chain(in_labels: List[str], offsets_frames: List[int], s: Settings, ou
 
 def build_slideshow_filter(first_slide: int, n_slides: int, s: Settings, out_label: str) -> str:
     """Filtergraph for slides first_slide..first_slide+n-1, fed as single-frame
-    inputs 0..n-1, -> [out_label]. Local time 0 = first slide's start."""
+    inputs 0..n-1, -> [out_label]. Local time 0 = first slide's start.
+
+    Performance: xfade only supports 4:4:4 formats, so every frame that goes
+    through it is converted yuv420p -> yuv444p -> yuv420p. Chaining whole
+    clips through xfade (xfade_chain) therefore converts *every* frame of the
+    video (~25% of the render CPU) although only the ~13 frames per transition
+    are blended. Instead each clip is split into body and transition pieces:
+    only the overlapping tail/head go through xfade, the bodies are
+    concatenated untouched (no chroma round trip, so they are also sharper).
+    Transition frames are bit-identical to the full-clip xfade chain."""
     motion = zoom_filters(s) if s.zoom_enabled else hold_filters(s)
-    parts = [
+    L = s.frames_per_image
+    origin = slide_start_frame(first_slide, s)
+    starts = [slide_start_frame(first_slide + i, s) - origin for i in range(n_slides)]
+    # overlap[k] = frames during which slide k-1 and slide k are blended
+    overlap = [0] + [starts[k - 1] + L - starts[k] for k in range(1, n_slides)]
+
+    clip = [
         f"[{i}:v]format=yuv420p,setsar=1,{motion},format=yuv420p,"
-        f"trim=duration={s.seconds_per_image:.6f}[v{i}]"
+        f"trim=duration={s.seconds_per_image:.6f}"
         for i in range(n_slides)
     ]
-    origin = slide_start_frame(first_slide, s)
-    offsets = [slide_start_frame(first_slide + i, s) - origin for i in range(1, n_slides)]
-    parts += xfade_chain([f"v{i}" for i in range(n_slides)], offsets, s, out_label)
+    if n_slides > 1 and not all(1 <= ov < L // 2 for ov in overlap[1:]):
+        # Degenerate fades (≈0 or longer than half a slide): use the plain chain.
+        parts = [f"{c}[v{i}]" for i, c in enumerate(clip)]
+        parts += xfade_chain([f"v{i}" for i in range(n_slides)], starts[1:], s, out_label)
+        return ";".join(parts)
+
+    def piece(src: str, a: int, b: int, out: str) -> str:
+        return f"[{src}]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS[{out}]"
+
+    parts, order = [], []
+    for k in range(n_slides):
+        # head: blended with the previous slide (+1 extra frame so xfade sees
+        # B continue past the transition, exactly as with the full clip)
+        head = overlap[k] + 1 if k > 0 else 0
+        tail = overlap[k + 1] if k + 1 < n_slides else 0
+        outs = (["h"] if head else []) + ["b"] + (["t"] if tail else [])
+        if len(outs) == 1:
+            parts.append(f"{clip[k]}[b{k}]")
+        else:
+            parts.append(f"{clip[k]},split={len(outs)}" + "".join(f"[{o}{k}s]" for o in outs))
+            if head:
+                parts.append(piece(f"h{k}s", 0, head, f"h{k}"))
+            parts.append(piece(f"b{k}s", head, L - tail, f"b{k}"))
+            if tail:
+                parts.append(piece(f"t{k}s", L - tail, L, f"t{k}"))
+        if k > 0:
+            parts.append(
+                f"[t{k - 1}][h{k}]xfade=transition={s.fade_name}:duration={s.fade_dur:.6f}:offset=0,"
+                f"format=yuv420p[x{k}]")
+            order.append(f"[x{k}]")
+        order.append(f"[b{k}]")
+    if len(order) == 1:
+        parts.append(f"{order[0]}copy[{out_label}]")
+    else:
+        # concat switches to a microsecond timebase; put the frames back on the
+        # exact 1/FPS grid so `t` in the bar/title animations matches frame times.
+        parts.append("".join(order) + f"concat=n={len(order)}:v=1:a=0,settb=1/{FPS},setpts=N[{out_label}]")
     return ";".join(parts)
 
 
@@ -770,24 +819,25 @@ def render_segments(segments: List[Segment], slides: List[str], tmpdir: str, s: 
     return [out for _, _, out in tasks]
 
 
-def join_segments(seg_paths: List[str], audio: str, out_path: str, tmpdir: str,
-                  audio_bitrate: str = "256k"):
-    """Concatenate encoded segments without re-encoding and add the audio track."""
+def join_segments(seg_paths: List[str], audio: str, out_path: str, tmpdir: str):
+    """Concatenate encoded segments and the (already AAC-encoded) audio track
+    without re-encoding anything."""
     list_file = os.path.join(tmpdir, "segments.txt")
     with open(list_file, "w") as f:
         for p in seg_paths:
             f.write("file '" + p.replace("'", "'\\''") + "'\n")
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-i", audio,
-           "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", audio_bitrate, "-shortest", out_path]
+           "-map", "0:v", "-map", "1:a", "-c", "copy", "-shortest", out_path]
     print_cmd("Joining segments + audio", cmd)
     rc = run_streaming(cmd)
     if rc != 0:
         die(f"ffmpeg failed with code {rc}")
 
 
-def render_video(slides: List[str], audio: str, audio_duration: float, out_path: str,
-                 tmpdir: str, s: Settings, max_per_segment: int, workers_override: Optional[int],
-                 title_card: Optional[str] = None, audio_bitrate: str = "256k"):
+def render_video(slides: List[str], audio_duration: float, tmpdir: str, s: Settings,
+                 max_per_segment: int, workers_override: Optional[int],
+                 title_card: Optional[str] = None) -> List[str]:
+    """Render all segments; returns their paths in order."""
     n = len(slides)
     cpus = os.cpu_count() or 2
 
@@ -796,7 +846,7 @@ def render_video(slides: List[str], audio: str, audio_duration: float, out_path:
     # for 15 slides at 1080p with 4x supersampling).
     frame_mb = max(1, s.width * s.height * s.supersample ** 2 * 3 // 2 // (1024 * 1024))
     slides_per_seg = min(n, max_per_segment, max(MIN_SLIDES_PER_SEGMENT, ceil(n / cpus))) + 1
-    if workers_override is not None:
+    if workers_override:  # 0/None = auto
         n_workers = max(1, workers_override)
     else:
         n_workers = workers_for(cpus, 250 + slides_per_seg * (40 + frame_mb), cpus)
@@ -805,8 +855,28 @@ def render_video(slides: List[str], audio: str, audio_duration: float, out_path:
                              ceil(audio_duration * FPS), s)
     n_workers = min(n_workers, len(segments))
 
-    seg_paths = render_segments(segments, slides, tmpdir, s, n_workers, title_card)
-    join_segments(seg_paths, audio, out_path, tmpdir, audio_bitrate)
+    return render_segments(segments, slides, tmpdir, s, n_workers, title_card)
+
+
+def prepare_audio(args, tmpdir: str) -> str:
+    """Enhance (optional), save the processed copy and encode the video's AAC
+    track. Runs in a background thread while the video renders: the render is
+    limited by the hardware video encoder, so the CPU has room for this."""
+    audio = args.audio
+    if args.audio_enhance:
+        audio = os.path.join(tmpdir, "audio_enhanced.wav")
+        enhance_audio.enhance(args.audio, audio, enhance_audio.options_from_args(args, prefix="audio-"))
+        save_path = args.audio_save or enhanced_audio_path(args.audio)
+        if save_path.lower().endswith(".wav"):
+            shutil.copyfile(audio, save_path)
+        else:
+            enhance_audio.convert(audio, save_path)
+        print("Processed audio saved:", save_path)
+    elif args.audio_save:
+        print("Warning: --audio-save ignored with --no-audio-enhance")
+    track = os.path.join(tmpdir, "audio_track.m4a")
+    enhance_audio.convert(audio, track, bitrate=args.audio_bitrate)
+    return track
 
 
 # --------------------------------------------------------------------------- #
@@ -853,7 +923,7 @@ def parse_args():
     p.add_argument("--blur", type=int, default=10, help="Background blur strength (boxblur radius). Applied once during preprocessing.")
     p.add_argument("--force-rgba", action="store_true", help="Force RGBA pixel format for the logo overlay (may slow down; use only if transparency processing explicitly needed).")
     p.add_argument("--max-inputs-per-pass", type=int, default=15, help="Max images per ffmpeg process. The video is always rendered as parallel segments (at least one per CPU core when there are enough images).")
-    p.add_argument("--segment-workers", type=int, default=None, help="Parallel workers for segment rendering. Default: auto-sized to CPU cores and available RAM.")
+    p.add_argument("--segment-workers", type=int, default=0, help="Parallel workers for segment rendering (default: 0 = auto-size to CPU cores and available RAM).")
     a = p.add_argument_group("audio", "Audio clean-up before muxing (see enhance_audio.py)")
     a.add_argument("--audio-enhance", action=argparse.BooleanOptionalAction, default=True,
                    help="High-pass + loudness normalisation (+ optional denoise) of the audio track (default: on; --no-audio-enhance uses the file as is)")
@@ -942,22 +1012,13 @@ def main():
         slides = prepare_slides(chosen, tmpdir, s)
         title_card = prepare_title_card(tmpdir, s)
 
-        audio = args.audio
-        if args.audio_enhance:
-            audio = os.path.join(tmpdir, "audio_enhanced.wav")
-            enhance_audio.enhance(args.audio, audio, enhance_audio.options_from_args(args, prefix="audio-"))
-            save_path = args.audio_save or enhanced_audio_path(args.audio)
-            if save_path.lower().endswith(".wav"):
-                shutil.copyfile(audio, save_path)
-            else:
-                enhance_audio.convert(audio, save_path)
-            print("Processed audio saved:", save_path)
-        elif args.audio_save:
-            print("Warning: --audio-save ignored with --no-audio-enhance")
-
         max_per_segment = max(2, args.max_inputs_per_pass or len(slides))
-        render_video(slides, audio, audio_duration, args.output, tmpdir, s,
-                     max_per_segment, args.segment_workers, title_card, args.audio_bitrate)
+        with ThreadPoolExecutor(max_workers=1) as audio_pool:
+            audio_job = audio_pool.submit(prepare_audio, args, tmpdir)
+            seg_paths = render_video(slides, audio_duration, tmpdir, s, max_per_segment,
+                                     args.segment_workers, title_card)
+            audio_track = audio_job.result()
+        join_segments(seg_paths, audio_track, args.output, tmpdir)
 
         print("Done:", args.output)
         print(f"Audio length: {audio_duration:.2f}s, images used: {len(slides)}, resolution: {s.width}x{s.height}")
