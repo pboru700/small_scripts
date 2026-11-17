@@ -8,7 +8,7 @@
 - Blurred full-frame background made from the same image
 - Slow Ken Burns camera move per slide, varied by default: zoom in, zoom out, zoom toward a corner, pan left/right (`--motion`; `--no-zoom` disables), rendered jitter-free via supersampling
 - Calm transitions picked per slide (`fade`, `fadeblack`, `smooth*`, `circleopen`, `hblur`), or any fixed FFmpeg `xfade` transition (`--fade-name`)
-- End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`); the length does not change
+- End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`), while the corner logo slides down off the screen; the length does not change
 - Bottom bar with centered text that slides up, stays visible, then slides away
   - `blur` style: frosted glass with optional color tint
   - `solid` style: flat semi-transparent color
@@ -125,7 +125,7 @@ Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades ou
 ### End screen
 | Option | Default | Description |
 |---|---|---|
-| `--end-screen` | `20` | The last N seconds of the video are dimmed and slightly desaturated (fading in over 1.5 s), as a calmer background for YouTube end-screen elements (YouTube allows 5–20 s). The video length and audio are unchanged. `0` disables. |
+| `--end-screen` | `20` | The last N seconds of the video are dimmed and slightly desaturated (fading in over 1.5 s), as a calmer background for YouTube end-screen elements (YouTube allows 5–20 s). While the dimming fades in, the corner logo slides down off the screen, so it does not cover end-screen elements. The video length and audio are unchanged. `0` disables (the logo then stays to the end). |
 | `--end-screen-dim` | `0.45` | How much darker the slides get at the end (`0.45` = 45% darker; `0`–`1`). |
 
 ### Audio
