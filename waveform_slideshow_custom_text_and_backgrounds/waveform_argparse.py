@@ -833,40 +833,93 @@ def prepare_glass(tmpdir: str, s: Settings) -> Optional[Glass]:
     return Glass(inputs=tuple(paths), region=(rx0, ry0, RW, RH))
 
 
-def glass_bar_filter(src: str, s: Settings, glass: Glass, i0: int) -> List[str]:
-    """[src] -> [slide_bar] with the liquid glass bar. The glass is cut from the
-    bar's resting position (like the blur style) and slides in with overlay;
-    the rim, text and mask move with it."""
+def bar_visible_frames(s: Settings):
+    """Global frames [a, b) in which the bar is on screen (b None = until the
+    end). Outside them bar_y_expr puts it at y = H, fully hidden."""
+    S, D, V = s.bar_slide_duration, s.bar_slide_in_delay, s.bar_visible_duration
+    if s.bar_height <= 0:
+        return 0, 0
+    if S <= 0:
+        return 0, None
+    return ceil(D * FPS - 1e-9), ceil((D + 2 * S + V) * FPS - 1e-9)
+
+
+def glass_parts(f0: int, n: Optional[int], s: Settings):
+    """Splits a segment's global frames [f0, f0 + n) (n None = open end) into
+    (start, end, with_glass) runs, so the glass is only rendered while the
+    bar is visible."""
+    a, b = bar_visible_frames(s)
+    f1 = f0 + n if n is not None else None
+    cuts = sorted({c for c in (a, b) if c is not None and c > f0 and (f1 is None or c < f1)})
+    bounds = [f0] + cuts + [f1]
+    return [(lo, hi, lo >= a and (b is None or lo < b)) for lo, hi in zip(bounds, bounds[1:])]
+
+
+def glass_bar_filter(src: str, s: Settings, glass: Glass, i0: int, out: str, tag: str = "") -> List[str]:
+    """[src] -> [out] with the liquid glass bar. The background seen through
+    the glass is captured at the bar's *current* position every frame (also
+    while it slides), with the frame's bottom row smeared below the frame for
+    the part that is already off screen. Labels are suffixed with `tag`."""
     gx, gy, gw, gh = s.glass_rect
     rx, ry, RW, RH = glass.region
     S, off, _ = GLASS_SHADOW
     bar_y = bar_y_expr(s)
-    # everything goes through planar RGB so displace treats all planes alike
-    chain = f"[glsrc]crop={RW}:{RH}:{rx}:{ry},format=gbrp"
+    L = lambda name: f"[{name}{tag}]"
+    # bottom strip from the capture region's resting top down, padded by one
+    # region height so the moving crop window never leaves it; both the crop
+    # and the overlays below round y down to even (yuv420), so they stay aligned
+    chain = (f"{L('glsrc')}crop=iw:{s.height - ry}:0:{ry},pad=iw:ih+{RH}:0:0,"
+             f"fillborders=bottom={RH}:mode=smear,crop={RW}:{RH}:{rx}:{bar_y}-{gy},format=gbrp")
     if s.glass_blur > 0:
         chain += f",gblur=sigma={s.glass_blur:.2f}"
-    chain += (f"[glbg];[{i0}:v]format=gbrp,loop=-1:1[gx];[{i0 + 1}:v]format=gbrp,loop=-1:1[gy];"
-              f"[glbg][gx][gy]displace=edge=smear,crop={gw}:{gh}:{gx - rx}:{gy - ry},"
+    chain += (f"{L('glbg')};[{i0}:v]format=gbrp,loop=-1:1{L('gx')};[{i0 + 1}:v]format=gbrp,loop=-1:1{L('gy')};"
+              f"{L('glbg')}{L('gx')}{L('gy')}displace=edge=smear,crop={gw}:{gh}:{gx - rx}:{gy - ry},"
               f"eq=saturation={GLASS_SATURATION}:brightness={GLASS_BRIGHTNESS},format=rgba")
     if s.bar_tint and s.glass_tint_alpha > 0:
         chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={s.bar_tint}@{s.glass_tint_alpha:.3f}:t=fill"
-    chain += f"[gltint];[{i0 + 2}:v]format=rgba,loop=-1:1[glrim];[gltint][glrim]overlay=format=auto"
+    chain += f"{L('gltint')};[{i0 + 2}:v]format=rgba,loop=-1:1{L('glrim')};{L('gltint')}{L('glrim')}overlay=format=auto"
     if s.text:
         chain += ",drawtext=" + build_drawtext_options(
             s.text, s.text_size, s.font, "(h-text_h)/2", bar_text_alpha(s))
-    chain += (f",format=rgba[gltxt];[{i0 + 3}:v]format=gray,loop=-1:1[glmask];"
-              f"[gltxt][glmask]alphamerge[glass];"
-              f"[{i0 + 4}:v]format=rgba,loop=-1:1[glshadow]")
+    chain += (f",format=rgba{L('gltxt')};[{i0 + 3}:v]format=gray,loop=-1:1{L('glmask')};"
+              f"{L('gltxt')}{L('glmask')}alphamerge{L('glass')};"
+              f"[{i0 + 4}:v]format=rgba,loop=-1:1{L('glshadow')}")
     return [
-        f"{src}split=2[base][glsrc]",
+        f"{src}split=2{L('base')}{L('glsrc')}",
         chain,
-        f"[base][glshadow]overlay=x={gx - S}:y={bar_y}-{S - off}:format=auto:shortest=1[glbase]",
-        f"[glbase][glass]overlay=x={gx}:y={bar_y}:format=auto:shortest=1,format=yuv420p[slide_bar]",
+        f"{L('base')}{L('glshadow')}overlay=x={gx - S}:y={bar_y}-{S - off}:format=auto:shortest=1{L('glbase')}",
+        f"{L('glbase')}{L('glass')}overlay=x={gx}:y={bar_y}:format=auto:shortest=1,format=yuv420p[{out}]",
     ]
 
 
+def glass_segment_filter(src: str, s: Settings, glass: Glass, i0: int, f0: int, n: Optional[int]) -> List[str]:
+    """Glass bar for one segment ([src] carries global frame pts from f0):
+    runs with the bar hidden bypass the whole glass chain; the runs are cut
+    with trim and joined again with concat (back on global frame pts)."""
+    parts = glass_parts(f0, n, s)
+    if len(parts) == 1:
+        if parts[0][2]:
+            return glass_bar_filter(src, s, glass, i0, "slide_bar")
+        return [f"{src}copy[slide_bar]"]
+    out = [f"{src}split={len(parts)}" + "".join(f"[gp{k}]" for k in range(len(parts)))]
+    for k, (lo, hi, visible) in enumerate(parts):
+        trim = f"trim=start_pts={lo}" + (f":end_pts={hi}" if hi is not None else "")
+        if visible:
+            out.append(f"[gp{k}]{trim}[gpt{k}]")
+            out += glass_bar_filter(f"[gpt{k}]", s, glass, i0, f"gpo{k}", tag=f"_{k}")
+        else:
+            out.append(f"[gp{k}]{trim},format=yuv420p[gpo{k}]")
+    out.append("".join(f"[gpo{k}]" for k in range(len(parts)))
+               + f"concat=n={len(parts)}:v=1:a=0,settb=1/{FPS},setpts=N+{f0}[slide_bar]")
+    return out
+
+
+def segment_needs_glass(s: Settings, f0: int, n: Optional[int]) -> bool:
+    return s.bar_style == "glass" and s.bar_height > 0 and any(v for _, _, v in glass_parts(f0, n, s))
+
+
 def build_overlay_filter(slide_label: str, s: Settings, glass: Optional[Glass] = None,
-                         glass_input: int = 0) -> str:
+                         glass_input: int = 0, seg_frames=(0, None)) -> str:
     """Adds the animated bottom bar (+text) to [slide_label] -> [slide_bar]."""
     parts = []
     src = f"[{slide_label}]"
@@ -876,7 +929,7 @@ def build_overlay_filter(slide_label: str, s: Settings, glass: Optional[Glass] =
     if bar_h <= 0:
         parts.append(f"{src}copy[slide_bar]")
     elif s.bar_style == "glass":
-        parts += glass_bar_filter(src, s, glass, glass_input)
+        parts += glass_segment_filter(src, s, glass, glass_input, *seg_frames)
     elif s.bar_style == "solid":
         color = f"{s.bar_color or '#000000'}@{s.bar_alpha:.3f}"
         chain = f"{src}drawbox=x=0:y={bar_y}:w=iw:h={bar_h}:color={color}:t=fill"
@@ -1243,6 +1296,9 @@ def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
     use_card = bool(title_card) and seg.start_frame < s.title_card_end * FPS
     card_index = n + len(logo_inputs)
     glass_index = card_index + (1 if use_card else 0)
+    seg_frames = (seg.start_frame, seg.trim_end - seg.trim_start if seg.trim_end is not None else None)
+    if glass and not segment_needs_glass(s, *seg_frames):
+        glass = None    # bar hidden for the whole segment: no glass inputs at all
 
     trim = f"trim=start_frame={seg.trim_start}"
     if seg.trim_end is not None:
@@ -1251,7 +1307,8 @@ def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
         build_slideshow_filter(seg.first_slide, n, s, out_label="chain"),
         # Shift to global time so the bar animation (which uses t) lines up across segments.
         f"[chain]{trim},setpts=PTS-STARTPTS+{seg.start_frame}/({FPS}*TB){end_screen_filter(seg, s)}[slide]",
-        build_overlay_filter("slide", s, glass, glass_index),
+        build_overlay_filter("slide", s, glass, glass_index, seg_frames)
+        if glass or s.bar_style != "glass" else "[slide]copy[slide_bar]",
         logo_filter(seg, logo, n, s) if logo else "[slide_bar]setsar=1[outv]",
     ] + ([title_card_filter("outv", card_index, title_card_size, s, "titled")] if use_card else []) + [
         f"[{'titled' if use_card else 'outv'}]setpts=PTS-STARTPTS[seg]",
