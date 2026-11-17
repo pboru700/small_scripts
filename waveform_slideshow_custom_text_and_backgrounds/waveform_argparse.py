@@ -859,8 +859,14 @@ def parse_args():
                    help="High-pass + loudness normalisation (+ optional denoise) of the audio track (default: on; --no-audio-enhance uses the file as is)")
     enhance_audio.add_cli_options(a, prefix="audio-")
     a.add_argument("--audio-bitrate", default="256k", help="AAC bitrate of the video's audio track (default: 256k)")
-    a.add_argument("--audio-save", default="", help="Also save the processed audio to this file (e.g. for Spotify; .wav/.flac/.mp3/.m4a)")
+    a.add_argument("--audio-save", default="", help="Where to save the processed audio (e.g. for Spotify; .wav/.flac/.mp3/.m4a). Default: next to --audio as <name>_enhanced.<ext>")
     return p.parse_args()
+
+
+def enhanced_audio_path(audio: str) -> str:
+    """song.wav -> song_enhanced.wav (same folder, same extension)."""
+    base, ext = os.path.splitext(audio)
+    return f"{base}_enhanced{ext}"
 
 
 def validate_inputs(args):
@@ -940,12 +946,12 @@ def main():
         if args.audio_enhance:
             audio = os.path.join(tmpdir, "audio_enhanced.wav")
             enhance_audio.enhance(args.audio, audio, enhance_audio.options_from_args(args, prefix="audio-"))
-            if args.audio_save:
-                if args.audio_save.lower().endswith(".wav"):
-                    shutil.copyfile(audio, args.audio_save)
-                else:
-                    enhance_audio.convert(audio, args.audio_save)
-                print("Processed audio saved:", args.audio_save)
+            save_path = args.audio_save or enhanced_audio_path(args.audio)
+            if save_path.lower().endswith(".wav"):
+                shutil.copyfile(audio, save_path)
+            else:
+                enhance_audio.convert(audio, save_path)
+            print("Processed audio saved:", save_path)
         elif args.audio_save:
             print("Warning: --audio-save ignored with --no-audio-enhance")
 

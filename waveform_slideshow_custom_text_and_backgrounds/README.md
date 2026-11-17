@@ -127,7 +127,7 @@ Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades ou
 | `--audio-denoise` | `off` | `light` / `strong` (FFmpeg `afftdn`) or `rnn` (`arnndn`, needs `--audio-rnn-model`). |
 | `--audio-rnn-model` | none | RNNoise `.rnnn` model, e.g. from [rnnoise-models](https://github.com/GregorR/rnnoise-models). |
 | `--audio-bitrate` | `256k` | AAC bitrate of the video's audio track. |
-| `--audio-save` | none | Also save the processed audio (`.wav`, `.flac`, `.mp3`, `.m4a`), e.g. for a Spotify upload. |
+| `--audio-save` | `<audio>_enhanced.<ext>` | The processed audio is always saved (with `--audio-enhance`), by default next to `--audio` with an `_enhanced` suffix, e.g. `odcinek.wav` → `odcinek_enhanced.wav`, ready for a Spotify upload. Pass a path (`.wav`, `.flac`, `.mp3`, `.m4a`) to save it elsewhere or in another format. An existing file is overwritten. |
 
 ### Encoding and performance
 | Flag | Default | Description |
