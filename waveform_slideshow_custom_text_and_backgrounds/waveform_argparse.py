@@ -963,9 +963,26 @@ def logo_filter(seg: Segment, logo: Logo, first_input: int, s: Settings) -> str:
     n = (seg.trim_end - seg.trim_start) if seg.trim_end is not None else 1
     i0 = first_input
     x, y = round(logo.cx - logo.w / 2), round(logo.cy - logo.h / 2)
+    # Lowest top edge of all logo layers (glow/ring stick out further than the
+    # logo); sliding everything down by H - top puts every layer off screen.
+    if s.logo_effect == "glow":
+        top = y - round(max(logo.w, logo.h) * 0.2)
+    elif s.logo_effect == "ring":
+        top = min(y, round(logo.cy - ring_canvas(logo) / 2))
+    elif s.logo_effect == "pulse":
+        top = round(logo.cy - logo.h * (1 + LOGO_PULSE) / 2)
+    else:
+        top = y
+
+    def ly(base: int) -> str:   # overlay y: slides off screen with the end screen
+        if s.end_start is None:
+            return str(base)
+        p = f"clip((t-{s.end_start:.4f})/{END_SCREEN_FADE}\\,0\\,1)"
+        return f"{base}+{s.height - top}*{p}*{p}*(3-2*{p})"
+
     if s.logo_effect == "none" or not logo.env:
         return (f"[{i0}:v]format=rgba,setsar=1[logo];"
-                f"[slide_bar]setsar=1[sb];[sb][logo]overlay=x={x}:y={y}:format=auto[outv]")
+                f"[slide_bar]setsar=1[sb];[sb][logo]overlay=x={x}:y={ly(y)}:format=auto[outv]")
 
     def stream(idx: int) -> str:   # one image -> n frames on the global timeline
         return (f"[{idx}:v]format=rgba,setsar=1,loop=loop={n - 1}:size=1,"
@@ -999,19 +1016,19 @@ def logo_filter(seg: Segment, logo: Logo, first_input: int, s: Settings) -> str:
         return (f"{stream(i0)},pad=iw+{2 * pw}:ih+{2 * ph}:{pw}:{ph}:color=black@0,{send},"
                 f"crop@lg=w={cw4}:h={ch4},scale={cw}:{ch}:flags=bicubic[logo];"
                 f"[slide_bar]setsar=1[sb];"
-                f"[sb][logo]overlay=x={round(logo.cx - cw / 2)}:y={round(logo.cy - ch / 2)}:format=auto[outv]")
+                f"[sb][logo]overlay=x={round(logo.cx - cw / 2)}:y={ly(round(logo.cy - ch / 2))}:format=auto[outv]")
     if s.logo_effect == "glow":
         m = round(max(logo.w, logo.h) * 0.2)
         return (f"{stream(i0)},{send},colorchannelmixer@gl=aa=0.08[glow];"
                 f"[{i0 + 1}:v]format=rgba,setsar=1[logo];[slide_bar]setsar=1[sb];"
-                f"[sb][glow]overlay=x={x - m}:y={y - m}:format=auto[sg];"
-                f"[sg][logo]overlay=x={x}:y={y}:format=auto[outv]")
+                f"[sb][glow]overlay=x={x - m}:y={ly(y - m)}:format=auto[sg];"
+                f"[sg][logo]overlay=x={x}:y={ly(y)}:format=auto[outv]")
     d = ring_canvas(logo)
     return (f"{stream(i0)},{send},crop@rg=w=400:h=400,scale={d}:{d}:flags=bicubic,"
             f"colorchannelmixer@rg=aa=0.15[ring];"
             f"[{i0 + 1}:v]format=rgba,setsar=1[logo];[slide_bar]setsar=1[sb];"
-            f"[sb][ring]overlay=x={round(logo.cx - d / 2)}:y={round(logo.cy - d / 2)}:format=auto[sr];"
-            f"[sr][logo]overlay=x={x}:y={y}:format=auto[outv]")
+            f"[sb][ring]overlay=x={round(logo.cx - d / 2)}:y={ly(round(logo.cy - d / 2))}:format=auto[sr];"
+            f"[sr][logo]overlay=x={x}:y={ly(y)}:format=auto[outv]")
 
 
 def ring_canvas(logo: Logo) -> int:
