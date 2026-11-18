@@ -1,14 +1,15 @@
 # Slideshow Video Generator
 
-`waveform_argparse.py` builds an MP4 slideshow from a folder of images and an audio track. Each image is scaled to fit a fixed resolution (aspect preserved), placed over a blurred, stretched copy of itself, given a slow camera move (zoom in or out, zoom toward a corner, or a pan), and blended into the next one with a varying calm transition. An animated frosted-glass bar with custom text slides in at the bottom, and an optional logo sits at its left end, glowing softly while someone speaks. The video lasts as long as the audio, with the last 20 s gently dimmed as an end screen; images loop if needed.
+`waveform_argparse.py` builds an MP4 slideshow from a folder of images and an audio track. Each image is scaled to fit a fixed resolution (aspect preserved), placed over a blurred, stretched copy of itself, given a slow camera move (zoom in or out, zoom toward a corner, or a pan), and blended into the next one with a varying calm transition. An animated frosted-glass bar with custom text slides in at the bottom, and an optional logo sits at its left end, glowing softly while someone speaks. The video lasts as long as the audio, with the last 10 s gently dimmed as an end screen; images loop if needed.
 
 ## Features
-- Fixed output resolution (default 1920x1080)
+- Fixed output resolution (default 2560x1440: YouTube serves its higher-quality VP9/AV1 encodes for 1440p+ uploads, so even 1080p viewers get a sharper picture). Pixel sizes (bar, text, logo, glass, blur) are tuned for 1080p and scale with the output height
+- Correct colors on YouTube: slides are converted once, explicitly, to BT.709 limited range and the video is tagged BT.709
 - "Contain" scaling: no cropping, aspect preserved, small images upscaled
 - Blurred full-frame background made from the same image
 - Slow Ken Burns camera move per slide, varied by default: zoom in, zoom out, zoom toward a corner, pan left/right (`--motion`; `--no-zoom` disables), rendered jitter-free via supersampling
 - Calm transitions picked per slide (`fade`, `fadeblack`, `smooth*`, `circleopen`, `hblur`), or any fixed FFmpeg `xfade` transition (`--fade-name`)
-- End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`); the length does not change. Without a sliding bar the logo slides down off the screen at the end screen
+- End screen: the last 10 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`); the length does not change. Without a sliding bar the logo slides down off the screen at the end screen
 - Bottom bar with centered text that slides up, stays visible, then slides away; the logo slides in and out with it
   - or several appearances, each with its own text and time range, from a JSON file (`--multi-text`)
   - `blur` style: frosted glass with optional color tint
@@ -21,7 +22,7 @@
 - Images loop when the audio is longer than one pass through the folder
 - Hardware encoding on macOS (VideoToolbox), chosen automatically
 - Parallel rendering across all CPU cores
-- Audio clean-up (on by default): rumble high-pass, optional denoise, loudness normalisation to -16 LUFS / -1 dBTP; also available standalone as `enhance_audio.py`
+- Audio clean-up (on by default): rumble high-pass, optional denoise, loudness normalisation to -14 LUFS for the video (YouTube's playback level) and -16 LUFS for the saved podcast copy, -1 dBTP; also available standalone as `enhance_audio.py`
 
 ## Requirements
 - Python 3.9+ (standard library only)
@@ -66,8 +67,8 @@ python3 waveform_argparse.py \
 |---|---|---|
 | `--images` | required | Folder with images (`.jpg`, `.jpeg`, `.png`, `.gif`, `.heic`), shown in case-insensitive filename order. |
 | `--audio` | required | Audio track (MP3, WAV, anything FFmpeg can decode). Sets the video length. |
-| `--output` | required | Output MP4 path. |
-| `--width`, `--height` | `1920`, `1080` | Output resolution. |
+| `--output` | `<audio>_<W>x<H>.mp4` | Output MP4 path. If omitted, the video goes next to the audio file, named after it with the resolution appended (`song.wav` → `song_2560x1440.mp4`). |
+| `--width`, `--height` | `2560`, `1440` | Output resolution. 1440p makes YouTube use its better VP9/AV1 encodes. |
 
 ### Slides
 | Flag | Default | Description |
@@ -76,7 +77,7 @@ python3 waveform_argparse.py \
 | `--fade-duration` | `0.5` | Crossfade length. Reduced to half of `--seconds-per-image` if it is too long. |
 | `--fade-name` | `mix` | Transition between slides. `mix` picks a calm one per slide (never twice in a row): `fade`, `fadeblack`, `smoothleft`, `smoothright`, `smoothup`, `smoothdown`, `circleopen`, `hblur`. Can also be one FFmpeg `xfade` name (`fade`, `wipeleft`, …) or a comma-separated list to pick from (`fade,fadeblack`). |
 | `--variation-seed` | `1` | Seed for the per-slide choice of transitions and camera moves. The same seed gives the same video; change it for a different arrangement. |
-| `--blur` | `10` | Background blur radius (boxblur). |
+| `--blur` | `10` at 1080p | Background blur radius (boxblur). Scaled with the output height (13 at 1440p). |
 
 ### Look
 | Flag | Default | Description |
@@ -93,21 +94,21 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 | `--zoom` / `--no-zoom` | on | Slow camera move during each slide's display time. |
 | `--motion` | `mix` | `mix`: per slide one of zoom in, zoom out, zoom toward a corner, pan left, pan right (never the same twice in a row). `in`: always zoom toward the center (the old behaviour). `out`: always zoom out. `pan`: only pans. |
 | `--zoom-end-percent` | `105` | Image scale at the most zoomed-in point (`100` = no zoom, `110` = 10% closer). Pans run at this scale. Values `<= 100` disable the camera moves. |
-| `--zoom-supersample` | `6` | The zoom crops in whole pixels, which at slow speeds looks like a 1px jitter. Cropping from an enlarged frame shrinks the step to `1/factor` px. Capped so the enlarged frame is at most 7680 px wide, so at 1080p the effective value is 4. Lower (1–2) renders faster; higher means smoother motion and more memory. |
+| `--zoom-supersample` | `6` | The zoom crops in whole pixels, which at slow speeds looks like a 1px jitter. Cropping from an enlarged frame shrinks the step to `1/factor` px. Capped so the enlarged frame is at most 7680 px wide, except that outputs up to 1440p always get at least 4x: the effective value is 4 at both 1080p and 1440p (2 at 4K). An explicit lower value (1–2) is honoured and renders faster; higher means smoother motion and more memory. |
 
 ### Bottom bar and text
 | Flag | Default | Description |
 |---|---|---|
-| `--bar-height` | `120` | Bar height in px. `0` disables the bar and text. |
-| `--bar-style` | `blur` | `blur` (frosted glass), `glass` (Liquid Glass capsule) or `solid` (flat color). |
-| `--bar-blur` | `20` | Blur radius for the `blur` style. |
+| `--bar-height` | `120` at 1080p | Bar height in px (160 at 1440p). `0` disables the bar and text. |
+| `--bar-style` | `glass` | `blur` (frosted glass), `glass` (Liquid Glass capsule) or `solid` (flat color). |
+| `--bar-blur` | `20` at 1080p | Blur radius for the `blur` style (27 at 1440p). |
 | `--bar-tint` | `#00464a` | Tint over the blurred bar. Empty string disables it. |
-| `--bar-tint-alpha` | `0.6` | Tint opacity. |
-| `--glass-inset` | `16` | `glass` style: gap between the capsule and the left/right/bottom frame edges (px). The capsule is `--bar-height` − inset tall; the logo and title card centre on it. |
+| `--bar-tint-alpha` | `0.75` | Tint opacity. |
+| `--glass-inset` | `16` at 1080p | `glass` style: gap between the capsule and the left/right/bottom frame edges (px). The capsule is `--bar-height` − inset tall; the logo and title card centre on it. |
 | `--glass-radius` | `0` | `glass` style: corner radius in px. `0` = capsule (fully rounded ends). |
-| `--glass-refraction` | `28` | `glass` style: lens strength — how far (px) the rim bends the image from outside the capsule into it. `0` disables refraction. |
-| `--glass-blur` | `4` | `glass` style: gaussian blur (sigma) of the content seen through the glass. |
-| `--glass-tint-alpha` | `0.25` | `glass` style: opacity of `--bar-tint` over the glass. |
+| `--glass-refraction` | `28` at 1080p | `glass` style: lens strength — how far (px) the rim bends the image from outside the capsule into it (37 at 1440p, max 127). `0` disables refraction. |
+| `--glass-blur` | `4` at 1080p | `glass` style: gaussian blur (sigma) of the content seen through the glass. |
+| `--glass-tint-alpha` | `0.6` | `glass` style: opacity of `--bar-tint` over the glass. |
 | `--bar-color` | `#00464a` | Color for the `solid` style. |
 | `--bar-alpha` | `0.7` | Opacity for the `solid` style. |
 | `--bar-slide-in-delay` | `3` | Seconds before the bar slides up. With `--title-card` the default is `--title-card-duration`, so the bar rises while the card glides into it. |
@@ -115,17 +116,17 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 | `--bar-slide-duration` | `1` | Length of each slide animation. `0` keeps the bar static for the whole video. |
 | `--text` | empty | Text centered in the bar (color `#ffb000` with a 6 px black outline). |
 | `--multi-text` | none | JSON file with several bar appearances, each with its own text (example: `bar_slide_timings.json`). The bar starts sliding in at `start` and is fully gone at `end`; the slide is shortened if a range is shorter than two `--bar-slide-duration`s. Times: `44`, `"44s"`, `"1m14s"` or `"1:14"`. Ranges must not overlap; parts past the end of the audio are dropped or shortened. Replaces `--text`, `--bar-slide-in-delay` and `--bar-visible-duration`. |
-| `--text-size` | `114` | Font size. The text (with its outline) is centred on the bar; if it would come closer than 6 px to the bar's top or bottom edge, the size is reduced until it fits (checked per text, a message is printed). |
+| `--text-size` | `114` at 1080p | Font size (152 at 1440p). The text (with its outline) is centred on the bar; if it would come closer than 6 px to the bar's top or bottom edge, the size is reduced until it fits (checked per text, a message is printed). |
 | `--font` | `/Library/Fonts/BebasNeue-Regular.ttf` | Font file for the text. |
 | `--logo` | none | Logo image (PNG with transparency recommended). Transparent margins are trimmed automatically. It is centred vertically on the bar (at its resting position) at the left edge. Empty or a missing file: no logo (a missing file prints a warning). |
 | `--logo-effect` | `glow` | How the logo reacts to the voice. `glow`: a soft orange (`#ff5800`) glow behind the logo lights up while someone speaks. `pulse`: the logo grows by up to 4%. `ring`: a thin orange (`#ff5800`) ring around the logo widens and brightens. `none`: static logo. The reaction follows phrases, not syllables (fast rise, ~0.45 s fall), and rests in pauses. |
-| `--logo-size` | bar height − 20 | Longest side of the logo in px. The default (100 px for a 120 px bar) keeps the logo and its effect inside the bar. Without a bar: 105 px in the bottom-left corner. |
+| `--logo-size` | bar height − 20 | Longest side of the logo in px. The default (100 px for a 120 px bar; the 20 px margin scales with the height) keeps the logo and its effect inside the bar. Without a bar: 105 px at 1080p in the bottom-left corner. |
 
 ### Title card
 | Flag | Default | Description |
 |---|---|---|
 | `--title-card` | none | Image (PNG recommended) shown centered at the start, scaled to fit the frame. A PNG with a transparent background (e.g. just the stylized title) works best, because the slide stays visible behind it. |
-| `--title-card-duration` | `4` | Seconds the card stays fully visible. |
+| `--title-card-duration` | `6` | Seconds the card stays fully visible. |
 | `--title-card-transition` | `--bar-slide-duration` | Seconds the card takes to shrink and glide into the bar. In the last 30% of the glide it fades out while the bar text fades in. After that the card is gone for good. |
 
 Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades out.
@@ -133,14 +134,15 @@ Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades ou
 ### End screen
 | Option | Default | Description |
 |---|---|---|
-| `--end-screen` | `20` | The last N seconds of the video are dimmed and slightly desaturated (fading in over 1.5 s), as a calmer background for YouTube end-screen elements (YouTube allows 5–20 s). While the dimming fades in, the corner logo slides down off the screen, so it does not cover end-screen elements. The video length and audio are unchanged. `0` disables (the logo then stays to the end). |
+| `--end-screen` | `10` | The last N seconds of the video are dimmed and slightly desaturated (fading in over 1.5 s), as a calmer background for YouTube end-screen elements (YouTube allows 5–20 s). While the dimming fades in, the corner logo slides down off the screen, so it does not cover end-screen elements. The video length and audio are unchanged. `0` disables (the logo then stays to the end). |
 | `--end-screen-dim` | `0.45` | How much darker the slides get at the end (`0.45` = 45% darker; `0`–`1`). |
 
 ### Audio
 | Flag | Default | Description |
 |---|---|---|
 | `--audio-enhance` / `--no-audio-enhance` | on | Process the audio before muxing (see [Audio clean-up](#audio-clean-up-enhance_audiopy)). `--no-audio-enhance` uses the file as is. |
-| `--audio-target-lufs` | `-16` | Integrated loudness target. YouTube and Spotify play at about `-14`. |
+| `--audio-target-lufs` | `-16` | Integrated loudness target of the saved copy (`--audio-save`, e.g. for a podcast feed). |
+| `--audio-video-lufs` | `-14` | Integrated loudness target of the video's audio track. YouTube plays at about `-14` and only turns loud tracks down, so a quieter upload just sounds quieter. The track is processed in a second pass from the original audio (same filters and limiter). |
 | `--audio-true-peak` | `-1` | True-peak ceiling in dBTP. |
 | `--audio-highpass` | `80` | High-pass cutoff in Hz (24 dB/oct). `0` disables it. |
 | `--audio-denoise` | `off` | `light` / `strong` (FFmpeg `afftdn`) or `rnn` (`arnndn`, needs `--audio-rnn-model`). |
@@ -152,17 +154,17 @@ Without a bar (`--bar-height 0`) the card glides to the bottom edge and fades ou
 | Flag | Default | Description |
 |---|---|---|
 | `--encoder` | `auto` | `auto`, `x264`, `vt_h264`, `vt_hevc`. `auto` picks `vt_h264` (VideoToolbox) on macOS, otherwise libx264. |
-| `--bitrate` | `6M` | Target bitrate. When set, it is used instead of CRF. Pass `--bitrate ""` to use CRF. |
+| `--bitrate` | `auto` | Target bitrate. `auto` = YouTube's recommended SDR upload bitrate for the output height: `40M` at 2160p+, `16M` at 1440p+, otherwise `8M`. Any other value (e.g. `12M`) is used as given, instead of CRF. Pass `--bitrate ""` to use CRF. |
 | `--crf` | `18` | Quality for libx264 (lower = better). For `vt_h264` without a bitrate it is mapped to `-q:v`. |
 | `--threads` | auto | libx264 threads per process. |
 | `--max-inputs-per-pass` | `15` | Maximum number of images per ffmpeg process (segment). Lower it to reduce memory use. |
 | `--segment-workers` | 0 (auto) | Number of segments rendered in parallel. `0` sizes it automatically to the CPU cores and free RAM. |
-| `--force-rgba` | off | Use RGBA for the logo overlay. Only needed for special transparency cases. |
+| `--force-rgba` | off | No effect; kept so existing commands keep working (slides are composed in RGB). |
 
 ## How it works
-1. **Prepare slides (parallel).** For every unique image: a "contain"-scaled foreground and a stretched, blurred background are written as JPEGs. They are then composited once into a lossless slide still, with the color grade and vignette applied. HEIC files are first converted with `sips`. The title card is pre-scaled once.
+1. **Prepare slides (parallel).** For every unique image, one ffmpeg run composes a "contain"-scaled foreground over a stretched, blurred background (in RGB; alpha is dropped), converts the result once, explicitly, to BT.709 limited range, applies the color grade and vignette, and stores it as a lossless slide still. There are no lossy intermediate files. HEIC files are first converted with `sips`. The title card is pre-scaled once.
 2. **Render segments (parallel).** The timeline is split into segments, at least one per worker. Each ffmpeg process reads its slides as single frames, so decoding and zoom supersampling happen once per slide, not once per frame. It then zooms, crossfades, adds the bar, text, logo and (in the first segments only) the title card, and encodes with the final settings. Segment boundaries sit just after a crossfade has finished, so the cuts are invisible.
-3. **Audio.** Unless `--no-audio-enhance`, the track is cleaned up with `enhance_audio.py` (see below).
+3. **Audio.** Unless `--no-audio-enhance`, the track is cleaned up with `enhance_audio.py` (see below): once to `--audio-target-lufs` for the saved copy and once to `--audio-video-lufs` for the video.
 4. **Join.** Segments are concatenated without re-encoding (`-c copy`) together with the audio track. The output is cut to the audio length.
 
 The audio (clean-up, saving `_enhanced`, AAC 256 kb/s encoding) is processed in a background thread while the segments render, so it adds no time. On macOS the AAC encoder is Apple's AudioToolbox (`aac_at`), which is ~6x faster than FFmpeg's built-in `aac`.
@@ -185,11 +187,14 @@ python3 enhance_audio.py episode.wav episode.mp3 --target-lufs -14 --denoise lig
 Output format follows the extension: `.wav`/`.flac` 24-bit lossless, `.mp3` 320 kb/s, `.m4a` AAC 256 kb/s (`--bitrate` overrides). Other flags match the `--audio-*` options above without the prefix, plus `--no-normalize`.
 
 ## Performance notes (Apple Silicon)
-- On a MacBook M2, a 9-minute video with 100 slides at 1080p renders in about 1.5 minutes.
+- On a MacBook M2, a 9-minute video with 100 slides at 1080p renders in about 1.5 minutes. The 1440p default takes about 1.7x as long (2.25x the pixels for the encoder and the zoom).
 - The hardware H.264/HEVC encoder is one shared unit (~200 fps at 1080p on M2). Parallel sessions split that throughput, so encoding time is the practical lower bound. This is why every frame is encoded only once. Render time therefore scales with the frame count: 30 fps takes about 20% longer than 25 fps.
 - Only the frames of each transition go through `xfade` (it works in 4:4:4 only, so every frame passing through it is converted 4:2:0 → 4:4:4 → 4:2:0). The rest of each slide is concatenated directly, which saves ~15–45% of the CPU and keeps the colours slightly sharper.
-- Each segment process needs about 1–1.3 GB of RAM with zoom at 1080p. If you have spare memory, `--segment-workers 8` can be ~10% faster than the cautious automatic choice.
+- Each segment process needs about 1–1.3 GB of RAM with zoom at 1080p, and about 1.5x that at 1440p (4x supersampling of a 2560 px frame). Segments that show the title card need about 2 GB more. The automatic worker count accounts for the resolution. If you have spare memory, `--segment-workers 8` can be ~10% faster than the cautious automatic choice.
 - `--zoom-supersample 2` or `--no-zoom` cut CPU time a lot. `--encoder x264` uses the CPU instead of the media engine: slower, but with exact CRF control.
+
+## TODO
+- **Residual zoom jitter.** `zoompan` rounds the crop position *and* the zoomed area's size to whole pixels of the supersampled frame. Measured by tracking a sharp edge frame by frame at 4x (1080p and 1440p alike), the motion still deviates up to ~0.5 px from a steady step and sometimes reverses direction; a 6x factor makes pans smooth but not zooms. Real fix: replace `zoompan` with true sub-pixel motion (e.g. a per-frame `scale` + `crop` of the supersampled still, or an interpolating transform), then re-measure.
 
 ## Errors
 The script exits with a message if FFmpeg/FFprobe (or `sips` for HEIC) is missing, an input path is invalid, no images are found, the audio duration cannot be read, or an ffmpeg step fails. In the last case the tail of ffmpeg's error output is printed.

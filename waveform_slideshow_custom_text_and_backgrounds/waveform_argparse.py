@@ -45,6 +45,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import dataclasses
 from dataclasses import dataclass
 from functools import lru_cache
 from math import ceil, exp, hypot, pi
@@ -57,11 +58,25 @@ SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.heic'}
 # Frame rate of the whole pipeline.
 FPS = 30
 
-# Supersampled frames for the zoom stage are capped at this width.
+# Supersampled frames for the zoom stage are capped at this width ...
 MAX_SUPERSAMPLE_WIDTH = 7680
+# ... except that outputs up to MAX_FLOOR_SUPERSAMPLE_WIDTH / MIN_AUTO_SUPERSAMPLE
+# px wide (1440p) always get at least MIN_AUTO_SUPERSAMPLE: below 4x the
+# zoom's 1/factor px steps become visible as jitter.
+MIN_AUTO_SUPERSAMPLE = 4
+MAX_FLOOR_SUPERSAMPLE_WIDTH = 10240
 
-# JPEG quality (-q:v, 2 = best) of the intermediate fg/bg images.
-JPEG_QUALITY = 2
+# Output colour: BT.709 limited range (what YouTube and players assume for HD).
+BT709_PARAMS = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+BT709_ENCODE_ARGS = ["-colorspace", "bt709", "-color_primaries", "bt709",
+                     "-color_trc", "bt709", "-color_range", "tv"]
+
+# Pixel sizes below are tuned for 1080p and scaled by height / REFERENCE_HEIGHT.
+REFERENCE_HEIGHT = 1080
+
+# --bitrate auto: YouTube's recommended SDR upload bitrate at 24-30 fps,
+# (minimum output height, bitrate), highest first.
+AUTO_BITRATES = ((2160, "40M"), (1440, "16M"), (0, "8M"))
 
 LOGO_SIZE = 105              # logo size without a bar (with a bar: bar height - 20)
 LOGO_MARGIN = 10
@@ -176,6 +191,8 @@ class Settings:
     bitrate: Optional[str]
     crf: int
     threads: Optional[int]
+    # height / REFERENCE_HEIGHT: scales the fixed 1080p-tuned pixel constants
+    px_scale: float
 
     @property
     def bar_top(self) -> int:
@@ -197,10 +214,21 @@ class Settings:
 
     @property
     def supersample(self) -> int:
-        """Effective zoom supersample factor (1 when zoom is off), capped by MAX_SUPERSAMPLE_WIDTH."""
+        """Effective zoom supersample factor (1 when zoom is off): capped so the
+        enlarged frame is <= MAX_SUPERSAMPLE_WIDTH wide, but never below
+        MIN_AUTO_SUPERSAMPLE for outputs up to 1440p (an explicit lower
+        --zoom-supersample is still honoured)."""
         if not self.zoom_enabled:
             return 1
-        return max(1, min(self.zoom_supersample, MAX_SUPERSAMPLE_WIDTH // max(1, self.width)))
+        w = max(1, self.width)
+        cap = MAX_SUPERSAMPLE_WIDTH // w
+        if w * MIN_AUTO_SUPERSAMPLE <= MAX_FLOOR_SUPERSAMPLE_WIDTH:
+            cap = max(MIN_AUTO_SUPERSAMPLE, cap)
+        return max(1, min(self.zoom_supersample, cap))
+
+    def px(self, v: float) -> int:
+        """A 1080p-tuned pixel size scaled to this output (integer, >= 1)."""
+        return max(1, round(v * self.px_scale))
 
     @property
     def title_card_end(self) -> float:
@@ -351,15 +379,15 @@ def decode_heic_to_png(src: str, out_path: str):
 
 
 def compose_slide(src: str, out_path: str, s: Settings, heic_tmp: Optional[str] = None):
-    """Render one finished slide still: the image scaled to "contain" the
-    target frame, centred over a stretched + blurred copy of itself.
+    """Render one finished slide still in a single ffmpeg run: the image
+    scaled to "contain" the target frame, centred over a stretched + blurred
+    copy of itself, colour-graded, stored losslessly (raw yuv420p in MKV).
 
-    Step 1 writes fg/bg JPEGs (as the script always did -- this also fixes
-    pixel-format/colour-range handling and drops alpha of PNG sources).
-    Step 2 composites them ONCE with the same overlay chain the renderer used
-    to run on every frame, and stores the result losslessly (raw yuv420p in
-    MKV, which keeps the colour range/matrix tags). Slides are therefore
-    pixel-identical to what the previous per-frame pipeline produced.
+    Colour handling: the source is decoded with its own tags (JPEG = full
+    range BT.601), composed in RGB (rgb24 also drops alpha, so transparent
+    PNG areas show their underlying colour, as before), and converted to YUV
+    exactly once, explicitly, to BT.709 limited range -- the standard YouTube
+    and players assume for HD. eq (look) needs YUV, so it runs after that.
     """
     if heic_tmp:
         rc, err = decode_heic_to_png(src, heic_tmp)
@@ -368,26 +396,16 @@ def compose_slide(src: str, out_path: str, s: Settings, heic_tmp: Optional[str] 
         src = heic_tmp
 
     w, h = s.width, s.height
-    base = os.path.splitext(out_path)[0]
-    fg_jpg, bg_jpg = base + "_fg.jpg", base + "_bg.jpg"
-
     fits_width = f"gte(iw/ih,{w}/{h})"
     scale_fg = f"scale='if({fits_width},{w},-1)':'if({fits_width},-1,{h})'"
-    rc, err = run_quiet([
-        "ffmpeg", "-y", "-i", src,
-        "-filter_complex", f"[0:v]split=2[a][b];[a]{scale_fg}[fg];[b]scale={w}:{h},boxblur={s.bg_blur}:1[bg]",
-        "-map", "[fg]", "-frames:v", "1", "-q:v", str(JPEG_QUALITY), fg_jpg,
-        "-map", "[bg]", "-frames:v", "1", "-q:v", str(JPEG_QUALITY), bg_jpg,
-    ])
-    if rc != 0:
-        return rc, err
-
-    fg_fmt = "rgba" if s.force_rgba else "yuva420p"
     return run_quiet([
-        "ffmpeg", "-y", "-i", fg_jpg, "-i", bg_jpg,
+        "ffmpeg", "-y", "-i", src,
         "-filter_complex",
-        f"[0:v]format={fg_fmt},setsar=1[fg];[1:v]format=yuv420p,setsar=1[bg];"
-        f"[bg][fg]overlay=x=(W-w)/2:y=(H-h)/2{look_filters(s)},format=yuv420p[out]",
+        f"[0:v]format=rgb24,setsar=1,split=2[a][b];[a]{scale_fg},setsar=1[fg];"
+        f"[b]scale={w}:{h},setsar=1,boxblur={s.bg_blur}:1[bg];"
+        f"[bg][fg]overlay=x=(W-w)/2:y=(H-h)/2:format=gbrp,"
+        f"scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,format=yuv444p{look_filters(s)},"
+        f"format=yuv420p,{BT709_PARAMS}[out]",
         "-map", "[out]", "-frames:v", "1", "-c:v", "rawvideo", out_path,
     ])
 
@@ -450,7 +468,7 @@ def prepare_slides(src_list: List[str], tmpdir: str, s: Settings) -> List[str]:
     if any(heic_map.values()):
         check_dep("sips")
 
-    # Two short single-frame ffmpeg runs per worker: ~200 MB overhead + frame buffers.
+    # One short single-frame ffmpeg run per worker: ~200 MB overhead + frame buffers.
     mem_per_worker = 200 + max(1, s.width * s.height * 5 // (1024 * 1024))
     workers = workers_for(len(unique_srcs), mem_per_worker, os.cpu_count() or 4)
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -474,7 +492,8 @@ def escape_drawtext_text(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'").replace("%", "%%")
 
 
-def build_drawtext_options(text: str, size: int, fontfile: str, y_pos, alpha: str = "") -> str:
+def build_drawtext_options(text: str, size: int, fontfile: str, y_pos, alpha: str = "",
+                           border: int = TEXT_BORDER) -> str:
     parts = []
     if fontfile:
         escaped_font = fontfile.replace("'", "\\'")
@@ -486,7 +505,7 @@ def build_drawtext_options(text: str, size: int, fontfile: str, y_pos, alpha: st
         "x=(w-text_w)/2",
         f"y={y_pos}",
         "box=0",
-        f"borderw={TEXT_BORDER}",
+        f"borderw={border}",
         "bordercolor=black",
     ]
     if alpha:
@@ -554,14 +573,14 @@ def window_text_alpha(s: Settings, k: int) -> str:
     return bar_text_alpha(s) if k == 0 and not s.multi_text else ""
 
 
-def measure_text(text: str, size: int, font: str):
+def measure_text(text: str, size: int, font: str, border: int = TEXT_BORDER):
     """(top, height) of the drawn text ink including the outline, with top
     relative to drawtext's y. Rendered once by FFmpeg on a transparent canvas."""
     y0, h = size, size * 4
     w = max(1000, min(16000, len(text) * size * 2))
     res = subprocess.run(
         ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", f"color=c=black@0:s={w}x{h}:d=1,format=rgba",
-         "-vf", "drawtext=" + build_drawtext_options(text, size, font, y0)
+         "-vf", "drawtext=" + build_drawtext_options(text, size, font, y0, border=border)
          + ",alphaextract,lut=y='if(gt(val\\,8)\\,255\\,0)',bbox",
          "-frames:v", "1", "-f", "null", "-"], capture_output=True, text=True)
     boxes = [line.split("crop=")[1].split()[0] for line in res.stderr.splitlines() if "crop=" in line]
@@ -571,14 +590,16 @@ def measure_text(text: str, size: int, font: str):
     return by - y0, bh
 
 
-def fit_bar_text(text: str, size: int, font: str, bar_h: int):
+def fit_bar_text(text: str, size: int, font: str, bar_h: int,
+                 border: int = TEXT_BORDER, min_gap: int = TEXT_MIN_GAP):
     """(font size, drawtext y inside the bar): the ink (with outline) is
-    centred on the bar; if it would come closer than TEXT_MIN_GAP to the
-    bar's top or bottom edge, the font is shrunk until the gaps are TEXT_MIN_GAP."""
+    centred on the bar; if it would come closer than `min_gap` to the
+    bar's top or bottom edge, the font is shrunk until the gaps are `min_gap`.
+    `border` = outline width (px)."""
     if not text or bar_h <= 0:
         return size, 0
-    avail = bar_h - 2 * TEXT_MIN_GAP
-    m = measure_text(text, size, font)
+    avail = bar_h - 2 * min_gap
+    m = measure_text(text, size, font, border)
     if m is None:   # nothing visible (e.g. only spaces)
         return size, 0
     start = size
@@ -586,9 +607,9 @@ def fit_bar_text(text: str, size: int, font: str, bar_h: int):
         if m[1] <= avail or size <= 4:
             break
         # outline thickness does not scale with the font, only the glyphs do
-        glyphs, target = max(1, m[1] - 2 * TEXT_BORDER), max(1, avail - 2 * TEXT_BORDER)
+        glyphs, target = max(1, m[1] - 2 * border), max(1, avail - 2 * border)
         size = max(4, min(size - 1, int(size * target / glyphs)))
-        m = measure_text(text, size, font) or m
+        m = measure_text(text, size, font, border) or m
     if size != start:
         print(f"Text {text!r} with outline is taller than the bar; font size {start} -> {size}")
     top, ink_h = m
@@ -606,7 +627,8 @@ def bar_drawtexts(s: Settings, y_pos: str, windows=None) -> str:
         if not text:
             continue
         size, ty = s.bar_text_layout[k]
-        opts = build_drawtext_options(text, size, s.font, f"{y_pos}+({ty})", window_text_alpha(s, k))
+        opts = build_drawtext_options(text, size, s.font, f"{y_pos}+({ty})", window_text_alpha(s, k),
+                                      border=s.px(TEXT_BORDER))
         if windows is None and len(s.bar_windows) > 1:
             opts += (f":enable=between(t\\,{a:.4f}\\,{b:.4f})" if b is not None
                      else f":enable=gte(t\\,{a:.4f})")
@@ -659,7 +681,8 @@ def zoom_filters(s: Settings, j: int = 0) -> str:
         (very slow) zoom that step is a ~1px pop every few frames -- clearly
         visible. Cropping from a `supersample`x-enlarged frame shrinks the step
         to 1/supersample px; measured smooth (no direction reversals) at >=4.
-        The factor is capped so the enlarged frame stays <= 7680 px wide.
+        The factor is capped so the enlarged frame stays <= 7680 px wide,
+        except that outputs up to 1440p always get >= 4x (Settings.supersample).
 
     Performance: the input is a single frame, so the supersampling `scale` runs
     once per slide; zoompan (d=frames) then emits every frame from it.
@@ -823,6 +846,12 @@ class Glass:
     region: tuple   # (x, y, w, h) of the captured background around the glass
 
 
+def glass_shadow(s: Settings):
+    """(spread px, y offset px, opacity) of the glass drop shadow, scaled to the output."""
+    spread, off, opacity = GLASS_SHADOW
+    return s.px(spread), s.px(off), opacity
+
+
 def _rrect_sdf(px: float, py: float, hw: float, hh: float, r: float):
     """Signed distance of (px, py) (relative to the centre) to a rounded
     rectangle with half sizes hw x hh and corner radius r (negative inside),
@@ -868,10 +897,14 @@ def prepare_glass(tmpdir: str, s: Settings) -> Optional[Glass]:
     P = max(0, s.glass_refraction)
 
     # captured region: the glass plus up to P px around it (clipped to the frame)
-    rx0, ry0 = max(0, gx - P), max(0, gy - P)
-    rx1, ry1 = min(W, gx + gw + P), min(H, gy + gh + P)
+    # Edges are aligned to even pixels: the yuv420 crops in glass_bar_filter
+    # round odd offsets down, and an odd region (e.g. an odd refraction) made
+    # its strip sizes disagree so fillborders failed.
+    rx0, ry0 = max(0, gx - P) // 2 * 2, max(0, gy - P) // 2 * 2
+    rx1, ry1 = min(W, (gx + gw + P + 1) // 2 * 2), min(H, (gy + gh + P + 1) // 2 * 2)
     RW, RH = rx1 - rx0, ry1 - ry0
-    bevel = max(6.0, min(r, hh) * 0.9)
+    k = s.px_scale                          # rim geometry is tuned for 1080p
+    bevel = max(6.0 * k, min(r, hh) * 0.9)
     xmap, ymap = bytearray([128]) * (RW * RH), bytearray([128]) * (RW * RH)
     for y in range(gy, gy + gh):
         py = y + 0.5 - (gy + hh)
@@ -897,13 +930,13 @@ def prepare_glass(tmpdir: str, s: Settings) -> Optional[Glass]:
             u = -d                                  # depth inside the glass
             facing = nx * lx + ny * ly
             spec = 0.25 + 0.75 * max(0.0, facing) ** 2 + 0.45 * max(0.0, -facing) ** 2
-            line = max(0.0, 1 - abs(u - 1.2) / 1.4) * min(1.0, spec) * 0.95
-            glow = exp(-u / 7) * 0.22 * spec
+            line = max(0.0, 1 - abs(u - 1.2 * k) / (1.4 * k)) * min(1.0, spec) * 0.95
+            glow = exp(-u / (7 * k)) * 0.22 * spec
             sheen = 0.07 * max(0.0, 1 - (y + 0.5) / (gh * 0.55))
             a = 1 - (1 - line) * (1 - glow) * (1 - sheen)
             rim[4 * i:4 * i + 4] = b"\xff\xff\xff" + bytes([round(255 * min(1.0, a))])
 
-    S, off, opacity = GLASS_SHADOW
+    S, off, opacity = glass_shadow(s)
     sw, sh = gw + 2 * S, gh + 2 * S
     shadow = bytearray(sw * sh * 4)
     for y in range(sh):
@@ -960,7 +993,7 @@ def glass_bar_filter(src: str, s: Settings, glass: Glass, i0: int, out: str, tag
     `win` = the bar window whose text is drawn (None = all of them)."""
     gx, gy, gw, gh = s.glass_rect
     rx, ry, RW, RH = glass.region
-    S, off, _ = GLASS_SHADOW
+    S, off, _ = glass_shadow(s)
     bar_y = bar_y_expr(s)
     L = lambda name: f"[{name}{tag}]"
     # bottom strip from the capture region's resting top down, padded by one
@@ -1247,12 +1280,13 @@ def prepare_logo(tmpdir: str, s: Settings, audio: str, n_frames: int) -> Optiona
     # Centre: half the bar height (or bottom-left corner without a bar), with
     # room around it for the ring (1.2x the logo).
     room = max(w, h) * 0.6
-    cx = LOGO_MARGIN + room
+    margin = s.px(LOGO_MARGIN)
+    cx = margin + room
     if s.bar_height > 0 and s.bar_style == "glass":
         # centre of the capsule's rounded left end
         gx, _, gw, gh = s.glass_rect
         cx = max(cx, gx + min(gh / 2, gw / 2))
-    cy = s.bar_center_y if s.bar_height > 0 else s.height - LOGO_MARGIN - room
+    cy = s.bar_center_y if s.bar_height > 0 else s.height - margin - room
 
     def make(name: str, vf: str, inp: Optional[List[str]] = None) -> str:
         out = os.path.join(tmpdir, name)
@@ -1353,7 +1387,9 @@ def logo_filter(seg: Segment, logo: Logo, first_input: int, s: Settings) -> str:
         cw4, ch4 = round(logo.w * 4 * (1 + LOGO_PULSE)), round(logo.h * 4 * (1 + LOGO_PULSE))
         pw, ph = (cw4 - logo.w * 4) // 2, (ch4 - logo.h * 4) // 2
         cw, ch = round(logo.w * (1 + LOGO_PULSE)), round(logo.h * (1 + LOGO_PULSE))
-        return (f"{stream(i0)},pad=iw+{2 * pw}:ih+{2 * ph}:{pw}:{ph}:color=black@0,{send},"
+        # Pad to exactly cw4 x ch4: with an odd margin, iw + 2 * (margin // 2)
+        # came out 1 px smaller than the crop window and the filter failed.
+        return (f"{stream(i0)},pad={cw4}:{ch4}:{pw}:{ph}:color=black@0,{send},"
                 f"crop@lg=w={cw4}:h={ch4},scale={cw}:{ch}:flags=bicubic[logo];"
                 f"[slide_bar]setsar=1[sb];"
                 f"[sb][logo]overlay=x={round(logo.cx - cw / 2)}:y={ly(round(logo.cy - ch / 2))}:format=auto[outv]")
@@ -1420,7 +1456,10 @@ def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
         if glass or s.bar_style != "glass" else "[slide]copy[slide_bar]",
         logo_filter(seg, logo, n, s) if logo else "[slide_bar]setsar=1[outv]",
     ] + ([title_card_filter("outv", card_index, title_card_size, s, "titled")] if use_card else []) + [
-        f"[{'titled' if use_card else 'outv'}]setpts=PTS-STARTPTS[seg]",
+        # Re-tag at the end: the encoder writes the frames' colour tags (ffmpeg 8
+        # ignores -color_primaries/-color_trc when the frames say "unknown"),
+        # and some filters in the graph drop primaries/transfer.
+        f"[{'titled' if use_card else 'outv'}]setpts=PTS-STARTPTS,{BT709_PARAMS}[seg]",
     ])
     cmd = ["ffmpeg", "-y"] + still_inputs(seg_slides + logo_inputs)
     if use_card:
@@ -1429,7 +1468,7 @@ def segment_command(seg: Segment, slides: List[str], out_path: str, s: Settings,
     if glass:
         cmd += still_inputs(glass.inputs)
     cmd += ["-filter_complex", graph, "-map", "[seg]", "-an"]
-    cmd += encoder_args(s, x264_threads) + ["-pix_fmt", "yuv420p", out_path]
+    cmd += encoder_args(s, x264_threads) + ["-pix_fmt", "yuv420p"] + BT709_ENCODE_ARGS + [out_path]
     return cmd
 
 
@@ -1502,14 +1541,23 @@ def prepare_audio(args, tmpdir: str) -> str:
     limited by the hardware video encoder, so the CPU has room for this."""
     audio = args.audio
     if args.audio_enhance:
-        audio = os.path.join(tmpdir, "audio_enhanced.wav")
-        enhance_audio.enhance(args.audio, audio, enhance_audio.options_from_args(args, prefix="audio-"))
+        # The saved copy (podcast / Spotify) is normalised to --audio-target-lufs;
+        # the video's track to --audio-video-lufs (YouTube plays at about -14 and
+        # only turns loud tracks down, so a quieter upload just sounds quiet).
+        opts = enhance_audio.options_from_args(args, prefix="audio-")
+        saved = os.path.join(tmpdir, "audio_enhanced.wav")
+        enhance_audio.enhance(args.audio, saved, opts)
         save_path = args.audio_save or enhanced_audio_path(args.audio)
         if save_path.lower().endswith(".wav"):
-            shutil.copyfile(audio, save_path)
+            shutil.copyfile(saved, save_path)
         else:
-            enhance_audio.convert(audio, save_path)
+            enhance_audio.convert(saved, save_path)
         print("Processed audio saved:", save_path)
+        audio = saved
+        if opts.normalize and args.audio_video_lufs != opts.target_lufs:
+            audio = os.path.join(tmpdir, "audio_video.wav")
+            enhance_audio.enhance(args.audio, audio,
+                                  dataclasses.replace(opts, target_lufs=args.audio_video_lufs))
     elif args.audio_save:
         print("Warning: --audio-save ignored with --no-audio-enhance")
     track = os.path.join(tmpdir, "audio_track.m4a")
@@ -1525,59 +1573,62 @@ def parse_args():
     p = argparse.ArgumentParser(description="Generate a slideshow video from images and an MP3.")
     p.add_argument("--images", required=True, help="Directory containing input images")
     p.add_argument("--audio", required=True, help="Audio file path (WAV, MP3, anything FFmpeg can decode)")
-    p.add_argument("--output", required=True, help="Output video file path (e.g. out.mp4)")
-    p.add_argument("--width", type=int, default=1920, help="Target video width (default: 1920)")
-    p.add_argument("--height", type=int, default=1080, help="Target video height (default: 1080)")
+    p.add_argument("--output", default=None, help="Output video file path (e.g. out.mp4). Default: the --audio path with _<width>x<height> appended and the extension changed to .mp4 (song.wav -> song_2560x1440.mp4)")
+    p.add_argument("--width", type=int, default=2560, help="Target video width (default: 2560; YouTube serves its better VP9/AV1 encodes for 1440p+ uploads)")
+    p.add_argument("--height", type=int, default=1440, help="Target video height (default: 1440)")
     p.add_argument("--seconds-per-image", type=float, default=6.0, help="Seconds each image remains before transition")
     p.add_argument("--fade-duration", type=float, default=0.5, help="Crossfade transition duration in seconds")
-    p.add_argument("--bar-height", type=int, default=120, help="Height of bottom bar")
+    p.add_argument("--bar-height", type=int, default=None, help="Height of bottom bar in px, 0 disables bar and text (default: 120 at 1080p; Scaled with the output height (value given is for 1080p))")
     p.add_argument("--bar-style", default="glass", choices=["blur", "glass", "solid"], help="Bottom bar style: 'blur' (frosted glass with optional tint), 'glass' (floating Liquid Glass capsule: edge refraction, specular rim, shadow) or 'solid' (flat alpha color)")
     p.add_argument("--bar-color", default="#00464a", help="Bar color for --bar-style solid (hex, e.g. #000000)")
     p.add_argument("--bar-alpha", type=float, default=0.7, help="Bar opacity for --bar-style solid (0.0 - 1.0)")
-    p.add_argument("--bar-blur", type=int, default=20, help="Blur radius for --bar-style blur (boxblur radius)")
+    p.add_argument("--bar-blur", type=int, default=None, help="Blur radius for --bar-style blur (boxblur radius; default: 20 at 1080p; Scaled with the output height (value given is for 1080p))")
     p.add_argument("--bar-tint", default="#00464a", help="Tint color overlaid on the blurred bar for --bar-style blur (hex). Empty string disables tint.")
-    p.add_argument("--bar-tint-alpha", type=float, default=0.75, help="Opacity of the bar tint for --bar-style blur (0.0 - 1.0)")
-    p.add_argument("--glass-inset", type=int, default=16, help="--bar-style glass: gap between the glass and the left/right/bottom frame edges in px (default: 16)")
+    p.add_argument("--bar-tint-alpha", type=float, default=0.75, help="Opacity of the bar tint for --bar-style blur (0.0 - 1.0, default: 0.75)")
+    p.add_argument("--glass-inset", type=int, default=None, help="--bar-style glass: gap between the glass and the left/right/bottom frame edges in px (default: 16 at 1080p; Scaled with the output height (value given is for 1080p))")
     p.add_argument("--glass-radius", type=int, default=0, help="--bar-style glass: corner radius in px (default: 0 = capsule, fully rounded ends)")
-    p.add_argument("--glass-refraction", type=int, default=28, help="--bar-style glass: lens strength = max displacement at the rim in px, 0 disables (default: 28)")
-    p.add_argument("--glass-blur", type=float, default=4.0, help="--bar-style glass: blur (gaussian sigma) of the content seen through the glass; Liquid Glass is mostly clear (default: 4)")
-    p.add_argument("--glass-tint-alpha", type=float, default=0.6, help="--bar-style glass: opacity of --bar-tint over the glass (default: 0.25)")
+    p.add_argument("--glass-refraction", type=int, default=None, help="--bar-style glass: lens strength = max displacement at the rim in px, 0 disables, max 127 (default: 28 at 1080p; Scaled with the output height (value given is for 1080p))")
+    p.add_argument("--glass-blur", type=float, default=None, help="--bar-style glass: blur (gaussian sigma) of the content seen through the glass; Liquid Glass is mostly clear (default: 4 at 1080p; Scaled with the output height (value given is for 1080p))")
+    p.add_argument("--glass-tint-alpha", type=float, default=0.6, help="--bar-style glass: opacity of --bar-tint over the glass (default: 0.6)")
     p.add_argument("--bar-slide-in-delay", type=float, default=None, help="Seconds before the bar slides up into view (default: 3, or --title-card-duration when a title card is used)")
     p.add_argument("--bar-visible-duration", type=float, default=30.0, help="Seconds the bar remains visible before sliding back down (default: 30)")
     p.add_argument("--bar-slide-duration", type=float, default=1.0, help="Duration of each slide animation in seconds, both in and out (default: 1)")
     p.add_argument("--zoom", action=argparse.BooleanOptionalAction, default=True, help="Slow Ken Burns zoom-in toward the center of each image during its display time (default: on; --no-zoom disables)")
     p.add_argument("--zoom-end-percent", type=float, default=105.0, help="On-screen scale of the image on its last frame before the transition, in percent (100 = no zoom, 110 = zoomed in 10%%). Only used with --zoom.")
-    p.add_argument("--zoom-supersample", type=int, default=6, help="Supersample factor for the zoom stage: higher = smoother motion (less 1px stepping), but slower and more memory. Try 6-8 for short/aggressive zooms or low resolutions; 1-2 to render faster. Capped so the enlarged frame stays <=7680px wide. Only used with --zoom.")
+    p.add_argument("--zoom-supersample", type=int, default=6, help="Supersample factor for the zoom stage: higher = smoother motion (less 1px stepping), but slower and more memory. Try 6-8 for short/aggressive zooms or low resolutions; 1-2 to render faster. The enlarged frame is capped at 7680px wide, but outputs up to 1440p always get at least 4x (an explicit lower value is honoured). Only used with --zoom. (default: 6)")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
     p.add_argument("--multi-text", default="", help="JSON file with several bar appearances, each with its own text: [{\"text\": \"...\", \"start\": \"44s\", \"end\": \"74s\"}, ...]. The bar slides in at start and is gone again at end (times: seconds, \"44s\", \"1m14s\" or \"1:14\"). Replaces --text, --bar-slide-in-delay and --bar-visible-duration")
-    p.add_argument("--text-size", type=int, default=114, help="Font size for bottom bar text")
+    p.add_argument("--text-size", type=int, default=None, help="Font size for bottom bar text (default: 114 at 1080p; Scaled with the output height (value given is for 1080p); shrunk to fit the bar if needed)")
     p.add_argument("--font", default="/Library/Fonts/BebasNeue-Regular.ttf", help="Optional font file path for drawtext")
     p.add_argument("--fade-name", default="mix", help="Transition between slides: 'mix' (default; a calm transition picked per slide: " + ", ".join(CALM_TRANSITIONS) + "), one FFmpeg xfade name (e.g. fade, wipeleft, circleopen) or a comma-separated list to pick from")
     p.add_argument("--motion", default="mix", choices=list(MOTION_POOLS), help="Camera move per slide with --zoom: 'mix' (default; zoom in, zoom out, zoom toward a corner, pan left/right, picked per slide), 'in' (always zoom toward the centre), 'out', 'pan'")
     p.add_argument("--variation-seed", type=int, default=1, help="Seed for the per-slide motion/transition choice; change it for a different arrangement (default: 1)")
-    p.add_argument("--end-screen", type=float, default=10.0, help="Dim the last N seconds of the video (same length, nothing added) as a calmer background for YouTube end screens (default: 20; 0 disables)")
+    p.add_argument("--end-screen", type=float, default=10.0, help="Dim the last N seconds of the video (same length, nothing added) as a calmer background for YouTube end screens (default: 10; 0 disables)")
     p.add_argument("--end-screen-dim", type=float, default=0.45, help="How much the end-screen slides are darkened, 0-1 (default: 0.45)")
     p.add_argument("--logo", default="", help="Logo image, shown at the left end of the bar (vertically centred on it). Transparent margins are trimmed automatically. Empty (default) or a missing file = no logo")
     p.add_argument("--logo-effect", default="glow", choices=list(LOGO_EFFECTS), help="Logo reaction to the voice: glow (default; soft orange #ff5800 glow behind the logo), pulse (logo grows up to 4%%), ring (orange #ff5800 ring around the logo widens and brightens), none (static logo)")
-    p.add_argument("--logo-size", type=int, default=0, help="Logo size in px (longest side). Default: bar height - 20, so the logo and its effect stay inside the bar")
+    p.add_argument("--logo-size", type=int, default=0, help="Logo size in px (longest side). Default: bar height - 20 (glass: capsule height - 20; 20 px at 1080p, scaled with the output height), so the logo and its effect stay inside the bar; 105 px at 1080p without a bar")
     p.add_argument("--title-card", default="", help="Optional title card image (PNG; transparency recommended) shown centred at the start, then shrinking down into the bottom bar")
-    p.add_argument("--title-card-duration", type=float, default=6.0, help="Seconds the title card stays fully visible before moving into the bar (default: 4)")
+    p.add_argument("--title-card-duration", type=float, default=6.0, help="Seconds the title card stays fully visible before moving into the bar (default: 6)")
     p.add_argument("--title-card-transition", type=float, default=None, help="Seconds the title card takes to glide into the bar (default: --bar-slide-duration, or 1 if that is 0)")
     p.add_argument("--contrast", type=float, default=1.05, help="Slide contrast (1.0 = unchanged, default: 1.05)")
     p.add_argument("--saturation", type=float, default=1.15, help="Slide saturation (1.0 = unchanged, default: 1.15)")
     p.add_argument("--vignette", type=float, default=0.3, help="Vignette strength 0-1 (0 = off, default: 0.3; 0.4 = FFmpeg's default vignette)")
     p.add_argument("--encoder", default="auto", choices=["auto", "x264", "vt_h264", "vt_hevc"], help="Video encoder: auto tries h264_videotoolbox if available on macOS")
-    p.add_argument("--bitrate", default="6M", help="Target video bitrate (e.g. 6M). If set, used instead of CRF for chosen encoder where applicable.")
+    p.add_argument("--bitrate", default="auto", help="Target video bitrate (e.g. 12M). 'auto' (default) = YouTube's recommended upload bitrate for the output height: 40M at 2160p+, 16M at 1440p+, otherwise 8M. Pass '' to use CRF instead.")
     p.add_argument("--crf", type=int, default=18, help="CRF value for x264 (quality). Ignored if --bitrate provided or hardware encoder without CRF.")
     p.add_argument("--threads", type=int, help="Threads for libx264 encoding (ignored for VideoToolbox).")
-    p.add_argument("--blur", type=int, default=10, help="Background blur strength (boxblur radius). Applied once during preprocessing.")
-    p.add_argument("--force-rgba", action="store_true", help="Force RGBA pixel format for the logo overlay (may slow down; use only if transparency processing explicitly needed).")
+    p.add_argument("--blur", type=int, default=None, help="Background blur strength (boxblur radius). Applied once during preprocessing. (default: 10 at 1080p; Scaled with the output height (value given is for 1080p))")
+    p.add_argument("--force-rgba", action="store_true", help="No effect; kept so existing commands keep working (slides are now composed in RGB).")
     p.add_argument("--max-inputs-per-pass", type=int, default=15, help="Max images per ffmpeg process. The video is always rendered as parallel segments (at least one per CPU core when there are enough images).")
     p.add_argument("--segment-workers", type=int, default=0, help="Parallel workers for segment rendering (default: 0 = auto-size to CPU cores and available RAM).")
     a = p.add_argument_group("audio", "Audio clean-up before muxing (see enhance_audio.py)")
     a.add_argument("--audio-enhance", action=argparse.BooleanOptionalAction, default=True,
                    help="High-pass + loudness normalisation (+ optional denoise) of the audio track (default: on; --no-audio-enhance uses the file as is)")
     enhance_audio.add_cli_options(a, prefix="audio-")
+    a.add_argument("--audio-video-lufs", type=float, default=-14.0,
+                   help="Loudness target of the video's audio track (default: -14, YouTube's playback level); "
+                        "the saved copy (--audio-save) uses --audio-target-lufs")
     a.add_argument("--audio-bitrate", default="256k", help="AAC bitrate of the video's audio track (default: 256k)")
     a.add_argument("--audio-save", default="", help="Where to save the processed audio (e.g. for Spotify; .wav/.flac/.mp3/.m4a). Default: next to --audio as <name>_enhanced.<ext>")
     return p.parse_args()
@@ -1589,6 +1640,11 @@ def enhanced_audio_path(audio: str) -> str:
     return f"{base}_enhanced{ext}"
 
 
+def default_output_path(audio: str, width: int, height: int) -> str:
+    """song.wav -> song_2560x1440.mp4 (same folder as the audio)."""
+    return f"{os.path.splitext(audio)[0]}_{width}x{height}.mp4"
+
+
 def validate_inputs(args):
     check_dep("ffmpeg")
     check_dep("ffprobe")
@@ -1596,6 +1652,9 @@ def validate_inputs(args):
         die(f"Images directory not found: {args.images}")
     if not os.path.isfile(args.audio):
         die(f"Audio file not found: {args.audio}")
+    if not args.output:
+        args.output = default_output_path(args.audio, args.width, args.height)
+        print(f"No --output given; writing to {args.output}")
     if args.logo and not os.path.isfile(os.path.expanduser(args.logo)):
         print(f"Warning: logo file not found ({args.logo}); rendering without a logo")
         args.logo = ""
@@ -1665,14 +1724,40 @@ def load_bar_windows(path: str, audio_duration: float) -> tuple:
     return tuple(windows)
 
 
-def default_logo_size(args) -> int:
+def default_logo_size(args, k: float) -> int:
     """Bar height - 20 (the glass capsule is shorter by --glass-inset), so the
-    logo and its effect stay inside the bar; LOGO_SIZE without a bar."""
+    logo and its effect stay inside the bar; LOGO_SIZE without a bar. The
+    1080p-tuned 20 / 40 / LOGO_SIZE are scaled by k = height / 1080."""
     inner = args.bar_height - (max(0, args.glass_inset) if args.bar_style == "glass" else 0)
-    return inner - 20 if inner > 40 else LOGO_SIZE
+    return inner - round(20 * k) if inner > 40 * k else round(LOGO_SIZE * k)
+
+
+# Flags whose 1080p-tuned defaults (in px) follow the output height when the
+# user does not set them: dest -> value at REFERENCE_HEIGHT.
+SCALED_DEFAULTS = {
+    "bar_height": 120, "text_size": 114, "glass_inset": 16, "glass_refraction": 28,
+    "bar_blur": 20, "blur": 10, "glass_blur": 4.0,
+}
+
+
+def resolve_scaled_defaults(args, k: float):
+    """Fill the flags left unset (None) with their 1080p default scaled by k.
+    An explicit value (including 0 = off) is used as given."""
+    for name, base in SCALED_DEFAULTS.items():
+        if getattr(args, name) is None:
+            setattr(args, name, base * k if isinstance(base, float) else max(1, round(base * k)))
+
+
+def resolve_bitrate(bitrate: Optional[str], height: int) -> Optional[str]:
+    """--bitrate auto -> YouTube's recommended bitrate for the output height."""
+    if bitrate != "auto":
+        return bitrate
+    return next(b for min_h, b in AUTO_BITRATES if height >= min_h)
 
 
 def make_settings(args, audio_duration: float) -> Settings:
+    px_scale = args.height / REFERENCE_HEIGHT
+    resolve_scaled_defaults(args, px_scale)
     fade_dur = args.fade_duration
     if fade_dur >= args.seconds_per_image:
         fade_dur = args.seconds_per_image / 2.0
@@ -1705,7 +1790,9 @@ def make_settings(args, audio_duration: float) -> Settings:
 
     text_bar_h = (args.bar_height - max(0, args.glass_inset) if args.bar_style == "glass"
                   else args.bar_height)
-    layout = tuple(fit_bar_text(text, args.text_size, args.font, text_bar_h)
+    text_border = max(1, round(TEXT_BORDER * px_scale))
+    text_gap = max(1, round(TEXT_MIN_GAP * px_scale))
+    layout = tuple(fit_bar_text(text, args.text_size, args.font, text_bar_h, text_border, text_gap)
                    for _, _, text in windows)
 
     transitions = ([t.strip() for t in args.fade_name.split(",") if t.strip()]
@@ -1731,13 +1818,14 @@ def make_settings(args, audio_duration: float) -> Settings:
         glass_tint_alpha=max(0.0, min(1.0, args.glass_tint_alpha)),
         text=args.text, text_size=args.text_size, font=args.font, logo=args.logo,
         logo_effect=args.logo_effect,
-        logo_size=args.logo_size if args.logo_size > 0 else default_logo_size(args),
+        logo_size=args.logo_size if args.logo_size > 0 else default_logo_size(args, px_scale),
         force_rgba=args.force_rgba,
         title_card=args.title_card, title_card_duration=max(0.0, args.title_card_duration),
         title_card_transition=max(0.0, title_trans),
         end_start=max(0.0, audio_duration - args.end_screen) if args.end_screen > 0 else None,
         end_dim=max(0.0, min(1.0, args.end_screen_dim)),
-        encoder=resolve_encoder(args.encoder), bitrate=args.bitrate, crf=args.crf, threads=args.threads,
+        encoder=resolve_encoder(args.encoder), bitrate=resolve_bitrate(args.bitrate, args.height),
+        crf=args.crf, threads=args.threads, px_scale=px_scale,
     )
 
 
@@ -1758,7 +1846,7 @@ def main():
     needed = slides_needed_for_audio(audio_duration, s.seconds_per_image, s.fade_dur)
     chosen = [images[i % len(images)] for i in range(needed)]
 
-    tmpdir = tempfile.mkdtemp(prefix="wave_jpeg_")
+    tmpdir = tempfile.mkdtemp(prefix="wave_slides_")
     try:
         with ThreadPoolExecutor(max_workers=1) as logo_pool:
             logo_job = logo_pool.submit(prepare_logo, tmpdir, s, args.audio, ceil(audio_duration * FPS))
