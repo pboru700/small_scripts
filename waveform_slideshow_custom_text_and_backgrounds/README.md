@@ -8,7 +8,7 @@
 - Blurred full-frame background made from the same image
 - Slow Ken Burns camera move per slide, varied by default: zoom in, zoom out, zoom toward a corner, pan left/right (`--motion`; `--no-zoom` disables), rendered jitter-free via supersampling
 - Calm transitions picked per slide (`fade`, `fadeblack`, `smooth*`, `circleopen`, `hblur`), or any fixed FFmpeg `xfade` transition (`--fade-name`)
-- End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`), while the corner logo slides down off the screen; the length does not change
+- End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`); the length does not change. The logo slides down together with the bar (or with the end screen when the bar does not slide)
 - Bottom bar with centered text that slides up, stays visible, then slides away
   - `blur` style: frosted glass with optional color tint
   - `glass` style: floating Liquid Glass capsule — the image bends around its rim (lens refraction), mostly clear with a light blur and a saturation boost, a specular edge highlight and a soft drop shadow

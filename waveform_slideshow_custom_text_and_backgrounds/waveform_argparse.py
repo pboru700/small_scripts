@@ -1205,11 +1205,22 @@ def logo_filter(seg: Segment, logo: Logo, first_input: int, s: Settings) -> str:
     else:
         top = y
 
-    def ly(base: int) -> str:   # overlay y: slides off screen with the end screen
-        if s.end_start is None:
-            return str(base)
+    S = s.bar_slide_duration
+    if s.bar_height > 0 and S > 0:
+        # Slides down together with the bar (same start, duration and linear
+        # motion). Layers sticking out above the bar travel a bit further so
+        # they leave the screen when the bar does.
+        out = s.bar_slide_in_delay + S + s.bar_visible_duration
+        dist = max(s.bar_height, s.height - top)
+        motion = f"{dist}*clip((t-{out:.4f})/{S:.4f}\\,0\\,1)"
+    elif s.end_start is not None:   # no moving bar: slides off with the end screen
         p = f"clip((t-{s.end_start:.4f})/{END_SCREEN_FADE}\\,0\\,1)"
-        return f"{base}+{s.height - top}*{p}*{p}*(3-2*{p})"
+        motion = f"{s.height - top}*{p}*{p}*(3-2*{p})"
+    else:
+        motion = ""
+
+    def ly(base: int) -> str:   # overlay y
+        return f"{base}+{motion}" if motion else str(base)
 
     if s.logo_effect == "none" or not logo.env:
         return (f"[{i0}:v]format=rgba,setsar=1[logo];"
