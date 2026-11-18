@@ -8,8 +8,9 @@
 - Blurred full-frame background made from the same image
 - Slow Ken Burns camera move per slide, varied by default: zoom in, zoom out, zoom toward a corner, pan left/right (`--motion`; `--no-zoom` disables), rendered jitter-free via supersampling
 - Calm transitions picked per slide (`fade`, `fadeblack`, `smooth*`, `circleopen`, `hblur`), or any fixed FFmpeg `xfade` transition (`--fade-name`)
-- End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`); the length does not change. The logo slides down together with the bar (or with the end screen when the bar does not slide)
-- Bottom bar with centered text that slides up, stays visible, then slides away
+- End screen: the last 20 s of the video are gently dimmed and desaturated, as a background for YouTube end screens (`--end-screen`); the length does not change. Without a sliding bar the logo slides down off the screen at the end screen
+- Bottom bar with centered text that slides up, stays visible, then slides away; the logo slides in and out with it
+  - or several appearances, each with its own text and time range, from a JSON file (`--multi-text`)
   - `blur` style: frosted glass with optional color tint
   - `glass` style: floating Liquid Glass capsule — the image bends around its rim (lens refraction), mostly clear with a light blur and a saturation boost, a specular edge highlight and a soft drop shadow
   - `solid` style: flat semi-transparent color
@@ -113,7 +114,8 @@ The look is applied to the slides only, so the bar, text, logo and title card ke
 | `--bar-visible-duration` | `30` | Seconds the bar stays fully visible before sliding down. |
 | `--bar-slide-duration` | `1` | Length of each slide animation. `0` keeps the bar static for the whole video. |
 | `--text` | empty | Text centered in the bar (color `#ffb000` with a 6 px black outline). |
-| `--text-size` | `114` | Font size. |
+| `--multi-text` | none | JSON file with several bar appearances, each with its own text (example: `bar_slide_timings.json`). The bar starts sliding in at `start` and is fully gone at `end`; the slide is shortened if a range is shorter than two `--bar-slide-duration`s. Times: `44`, `"44s"`, `"1m14s"` or `"1:14"`. Ranges must not overlap; parts past the end of the audio are dropped or shortened. Replaces `--text`, `--bar-slide-in-delay` and `--bar-visible-duration`. |
+| `--text-size` | `114` | Font size. The text (with its outline) is centred on the bar; if it would come closer than 6 px to the bar's top or bottom edge, the size is reduced until it fits (checked per text, a message is printed). |
 | `--font` | `/Library/Fonts/BebasNeue-Regular.ttf` | Font file for the text. |
 | `--logo` | none | Logo image (PNG with transparency recommended). Transparent margins are trimmed automatically. It is centred vertically on the bar (at its resting position) at the left edge. Empty or a missing file: no logo (a missing file prints a warning). |
 | `--logo-effect` | `glow` | How the logo reacts to the voice. `glow`: a soft orange (`#ff5800`) glow behind the logo lights up while someone speaks. `pulse`: the logo grows by up to 4%. `ring`: a thin orange (`#ff5800`) ring around the logo widens and brightens. `none`: static logo. The reaction follows phrases, not syllables (fast rise, ~0.45 s fall), and rests in pauses. |

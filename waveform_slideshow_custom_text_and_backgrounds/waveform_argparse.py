@@ -36,8 +36,10 @@ Pipeline:
   4. Join: segments are concatenated without re-encoding and the audio added.
 """
 import argparse
+import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -72,6 +74,7 @@ LOGO_RING = (1.06, 1.16)             # ring: radius range, relative to the logo 
 LOGO_GLOW_COLOR = (255, 88, 0)       # glow and ring colour (#ff5800)
 TEXT_COLOR = "#ffb000"
 TEXT_BORDER = 6                       # black outline around the bar text (px)
+TEXT_MIN_GAP = 6                      # min gap between the text (with outline) and the bar's top/bottom (px)
 
 # Title card: initial size ("contain" in this fraction of the frame) and the
 # fraction of the bar height it shrinks to when it lands in the bar.
@@ -142,6 +145,13 @@ class Settings:
     bar_slide_in_delay: float
     bar_visible_duration: float
     bar_slide_duration: float
+    # (start, end | None, text) per bar appearance, in seconds; the bar slides
+    # in from `start` and is fully gone again at `end` (None = stays)
+    bar_windows: tuple
+    # (font size, y of the drawtext line inside the bar) per window: the text
+    # ink (with outline) is centred on the bar and shrunk to fit if needed
+    bar_text_layout: tuple
+    multi_text: bool            # windows come from --multi-text (no title-card text fade)
     glass_inset: int            # glass: gap to the left/right/bottom frame edges (px)
     glass_radius: int           # glass: corner radius (px), 0 = capsule
     glass_refraction: int       # glass: max lens displacement at the edge (px)
@@ -503,24 +513,105 @@ def bar_text_alpha(s: Settings) -> str:
     return f"clip((t-{st:.4f})/{d:.4f}\\,0\\,1)"
 
 
-def bar_y_expr(s: Settings) -> str:
-    """FFmpeg y-position expression: bar hidden -> slides up after the delay ->
-    visible for visible_duration -> slides down.
+def window_slide(s: Settings, a: float, b: Optional[float]) -> float:
+    """Slide-in/out duration of one bar window (shortened for short windows)."""
+    S = max(0.0, s.bar_slide_duration)
+    return S if b is None else min(S, (b - a) / 2)
+
+
+def bar_hidden_expr(s: Settings) -> str:
+    """FFmpeg expression of t: 0 = bar fully up, 1 = fully below the frame.
+    Each window slides in linearly from its start and is gone at its end.
 
     \\, escapes commas so the filter graph parser does not treat them as filter separators.
     """
-    S, D, V = s.bar_slide_duration, s.bar_slide_in_delay, s.bar_visible_duration
-    if S <= 0:
-        return str(s.bar_top)
-    H, B, top = s.height, s.bar_height, s.bar_top
-    # phases: hidden | sliding in | visible | sliding out | hidden
-    return (
-        f"if(lt(t\\,{D})\\,{H}\\,"
-        f"if(lt(t\\,{D}+{S})\\,{H}-{B}*(t-{D})/{S}\\,"
-        f"if(lt(t\\,{D}+{S}+{V})\\,{top}\\,"
-        f"if(lt(t\\,{D}+{S}+{V}+{S})\\,{top}+{B}*(t-{D}-{S}-{V})/{S}\\,"
-        f"{H}))))"
-    )
+    terms = []
+    for a, b, _ in s.bar_windows:
+        S = window_slide(s, a, b)
+        if b is None:
+            if S <= 0 and a <= 0:
+                return "0"
+            terms.append(f"clip((t-{a:.4f})/{S:.4f}\\,0\\,1)" if S > 0 else f"gte(t\\,{a:.4f})")
+        elif S > 0:
+            terms.append(f"clip(min(t-{a:.4f}\\,{b:.4f}-t)/{S:.4f}\\,0\\,1)")
+        else:
+            terms.append(f"gte(t\\,{a:.4f})*lt(t\\,{b:.4f})")
+    if not terms:
+        return "1"
+    return "(1-(" + "+".join(terms) + "))"
+
+
+def bar_y_expr(s: Settings) -> str:
+    """FFmpeg y-position expression of the bar's top edge (bar_top when up,
+    H when hidden), following the bar windows."""
+    h = bar_hidden_expr(s)
+    return str(s.bar_top) if h == "0" else f"{s.bar_top}+{s.bar_height}*{h}"
+
+
+def window_text_alpha(s: Settings, k: int) -> str:
+    """Text opacity of window k: only the first default-mode window waits for
+    the title card to land."""
+    return bar_text_alpha(s) if k == 0 and not s.multi_text else ""
+
+
+def measure_text(text: str, size: int, font: str):
+    """(top, height) of the drawn text ink including the outline, with top
+    relative to drawtext's y. Rendered once by FFmpeg on a transparent canvas."""
+    y0, h = size, size * 4
+    w = max(1000, min(16000, len(text) * size * 2))
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", f"color=c=black@0:s={w}x{h}:d=1,format=rgba",
+         "-vf", "drawtext=" + build_drawtext_options(text, size, font, y0)
+         + ",alphaextract,lut=y='if(gt(val\\,8)\\,255\\,0)',bbox",
+         "-frames:v", "1", "-f", "null", "-"], capture_output=True, text=True)
+    boxes = [line.split("crop=")[1].split()[0] for line in res.stderr.splitlines() if "crop=" in line]
+    if not boxes:
+        return None
+    _, bh, _, by = (int(v) for v in boxes[-1].split(":"))
+    return by - y0, bh
+
+
+def fit_bar_text(text: str, size: int, font: str, bar_h: int):
+    """(font size, drawtext y inside the bar): the ink (with outline) is
+    centred on the bar; if it would come closer than TEXT_MIN_GAP to the
+    bar's top or bottom edge, the font is shrunk until the gaps are TEXT_MIN_GAP."""
+    if not text or bar_h <= 0:
+        return size, 0
+    avail = bar_h - 2 * TEXT_MIN_GAP
+    m = measure_text(text, size, font)
+    if m is None:   # nothing visible (e.g. only spaces)
+        return size, 0
+    start = size
+    for _ in range(40):
+        if m[1] <= avail or size <= 4:
+            break
+        # outline thickness does not scale with the font, only the glyphs do
+        glyphs, target = max(1, m[1] - 2 * TEXT_BORDER), max(1, avail - 2 * TEXT_BORDER)
+        size = max(4, min(size - 1, int(size * target / glyphs)))
+        m = measure_text(text, size, font) or m
+    if size != start:
+        print(f"Text {text!r} with outline is taller than the bar; font size {start} -> {size}")
+    top, ink_h = m
+    return size, round((bar_h - ink_h) / 2 - top)
+
+
+def bar_drawtexts(s: Settings, y_pos: str, windows=None) -> str:
+    """',drawtext=...' for each window's text (enabled only inside its window
+    when there are several); `y_pos` = y of the bar's top edge in the frame
+    the text is drawn on."""
+    ks = range(len(s.bar_windows)) if windows is None else windows
+    out = ""
+    for k in ks:
+        a, b, text = s.bar_windows[k]
+        if not text:
+            continue
+        size, ty = s.bar_text_layout[k]
+        opts = build_drawtext_options(text, size, s.font, f"{y_pos}+({ty})", window_text_alpha(s, k))
+        if windows is None and len(s.bar_windows) > 1:
+            opts += (f":enable=between(t\\,{a:.4f}\\,{b:.4f})" if b is not None
+                     else f":enable=gte(t\\,{a:.4f})")
+        out += ",drawtext=" + opts
+    return out
 
 
 @lru_cache(maxsize=None)
@@ -833,33 +924,40 @@ def prepare_glass(tmpdir: str, s: Settings) -> Optional[Glass]:
     return Glass(inputs=tuple(paths), region=(rx0, ry0, RW, RH))
 
 
-def bar_visible_frames(s: Settings):
-    """Global frames [a, b) in which the bar is on screen (b None = until the
-    end). Outside them bar_y_expr puts it at y = H, fully hidden."""
-    S, D, V = s.bar_slide_duration, s.bar_slide_in_delay, s.bar_visible_duration
+def bar_frame_windows(s: Settings):
+    """Global frames [a, b) of each bar window (b None = until the end).
+    Outside them bar_y_expr puts the bar at y = H, fully hidden."""
     if s.bar_height <= 0:
-        return 0, 0
-    if S <= 0:
-        return 0, None
-    return ceil(D * FPS - 1e-9), ceil((D + 2 * S + V) * FPS - 1e-9)
+        return []
+    return [(ceil(a * FPS - 1e-9), None if b is None else ceil(b * FPS - 1e-9))
+            for a, b, _ in s.bar_windows]
 
 
 def glass_parts(f0: int, n: Optional[int], s: Settings):
     """Splits a segment's global frames [f0, f0 + n) (n None = open end) into
-    (start, end, with_glass) runs, so the glass is only rendered while the
-    bar is visible."""
-    a, b = bar_visible_frames(s)
+    (start, end, window index | None) runs, so the glass is only rendered
+    while the bar is visible (and each run draws its window's text)."""
+    wins = bar_frame_windows(s)
     f1 = f0 + n if n is not None else None
-    cuts = sorted({c for c in (a, b) if c is not None and c > f0 and (f1 is None or c < f1)})
+    cuts = sorted({c for w in wins for c in w
+                   if c is not None and c > f0 and (f1 is None or c < f1)})
     bounds = [f0] + cuts + [f1]
-    return [(lo, hi, lo >= a and (b is None or lo < b)) for lo, hi in zip(bounds, bounds[1:])]
+
+    def which(lo: int):
+        for k, (a, b) in enumerate(wins):
+            if lo >= a and (b is None or lo < b):
+                return k
+        return None
+    return [(lo, hi, which(lo)) for lo, hi in zip(bounds, bounds[1:])]
 
 
-def glass_bar_filter(src: str, s: Settings, glass: Glass, i0: int, out: str, tag: str = "") -> List[str]:
+def glass_bar_filter(src: str, s: Settings, glass: Glass, i0: int, out: str, tag: str = "",
+                     win: Optional[int] = None) -> List[str]:
     """[src] -> [out] with the liquid glass bar. The background seen through
     the glass is captured at the bar's *current* position every frame (also
     while it slides), with the frame's bottom row smeared below the frame for
-    the part that is already off screen. Labels are suffixed with `tag`."""
+    the part that is already off screen. Labels are suffixed with `tag`;
+    `win` = the bar window whose text is drawn (None = all of them)."""
     gx, gy, gw, gh = s.glass_rect
     rx, ry, RW, RH = glass.region
     S, off, _ = GLASS_SHADOW
@@ -878,9 +976,7 @@ def glass_bar_filter(src: str, s: Settings, glass: Glass, i0: int, out: str, tag
     if s.bar_tint and s.glass_tint_alpha > 0:
         chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={s.bar_tint}@{s.glass_tint_alpha:.3f}:t=fill"
     chain += f"{L('gltint')};[{i0 + 2}:v]format=rgba,loop=-1:1{L('glrim')};{L('gltint')}{L('glrim')}overlay=format=auto"
-    if s.text:
-        chain += ",drawtext=" + build_drawtext_options(
-            s.text, s.text_size, s.font, "(h-text_h)/2", bar_text_alpha(s))
+    chain += bar_drawtexts(s, "0", None if win is None else [win])
     chain += (f",format=rgba{L('gltxt')};[{i0 + 3}:v]format=gray,loop=-1:1{L('glmask')};"
               f"{L('gltxt')}{L('glmask')}alphamerge{L('glass')};"
               f"[{i0 + 4}:v]format=rgba,loop=-1:1{L('glshadow')}")
@@ -898,15 +994,15 @@ def glass_segment_filter(src: str, s: Settings, glass: Glass, i0: int, f0: int, 
     with trim and joined again with concat (back on global frame pts)."""
     parts = glass_parts(f0, n, s)
     if len(parts) == 1:
-        if parts[0][2]:
-            return glass_bar_filter(src, s, glass, i0, "slide_bar")
+        if parts[0][2] is not None:
+            return glass_bar_filter(src, s, glass, i0, "slide_bar", win=parts[0][2])
         return [f"{src}copy[slide_bar]"]
     out = [f"{src}split={len(parts)}" + "".join(f"[gp{k}]" for k in range(len(parts)))]
-    for k, (lo, hi, visible) in enumerate(parts):
+    for k, (lo, hi, win) in enumerate(parts):
         trim = f"trim=start_pts={lo}" + (f":end_pts={hi}" if hi is not None else "")
-        if visible:
+        if win is not None:
             out.append(f"[gp{k}]{trim}[gpt{k}]")
-            out += glass_bar_filter(f"[gpt{k}]", s, glass, i0, f"gpo{k}", tag=f"_{k}")
+            out += glass_bar_filter(f"[gpt{k}]", s, glass, i0, f"gpo{k}", tag=f"_{k}", win=win)
         else:
             out.append(f"[gp{k}]{trim},format=yuv420p[gpo{k}]")
     out.append("".join(f"[gpo{k}]" for k in range(len(parts)))
@@ -915,7 +1011,7 @@ def glass_segment_filter(src: str, s: Settings, glass: Glass, i0: int, f0: int, 
 
 
 def segment_needs_glass(s: Settings, f0: int, n: Optional[int]) -> bool:
-    return s.bar_style == "glass" and s.bar_height > 0 and any(v for _, _, v in glass_parts(f0, n, s))
+    return s.bar_style == "glass" and s.bar_height > 0 and any(w is not None for _, _, w in glass_parts(f0, n, s))
 
 
 def build_overlay_filter(slide_label: str, s: Settings, glass: Optional[Glass] = None,
@@ -931,19 +1027,22 @@ def build_overlay_filter(slide_label: str, s: Settings, glass: Optional[Glass] =
     elif s.bar_style == "glass":
         parts += glass_segment_filter(src, s, glass, glass_input, *seg_frames)
     elif s.bar_style == "solid":
+        # A translucent colour strip slid in with overlay: drawbox cannot move
+        # (its x/y are evaluated once, and `t` there means box thickness).
+        # The strip is put on the segment's global frame pts so `t` matches.
         color = f"{s.bar_color or '#000000'}@{s.bar_alpha:.3f}"
-        chain = f"{src}drawbox=x=0:y={bar_y}:w=iw:h={bar_h}:color={color}:t=fill"
-        if s.text:
-            chain += ",drawtext=" + build_drawtext_options(
-                s.text, s.text_size, s.font, f"{bar_y}+({bar_h}-text_h)/2", bar_text_alpha(s))
-        parts.append(chain + "[slide_bar]")
+        strip = (f"color=c={color}:s={s.width}x{bar_h}:r={FPS},format=rgba,"
+                 f"settb=1/{FPS},setpts=N+{seg_frames[0]}")
+        strip += bar_drawtexts(s, "0")
+        parts += [
+            f"{strip}[solidbar]",
+            f"{src}[solidbar]overlay=x=0:y={bar_y}:format=auto:shortest=1,format=yuv420p[slide_bar]",
+        ]
     else:  # blur: frosted strip cut from the bar's resting position, slid in with overlay
         blur_chain = f"crop=iw:{bar_h}:0:{s.bar_top},boxblur={s.bar_blur}:5"
         if s.bar_tint:
             blur_chain += f",drawbox=x=0:y=0:w=iw:h=ih:color={s.bar_tint}@{s.bar_tint_alpha:.3f}:t=fill"
-        if s.text:
-            blur_chain += ",drawtext=" + build_drawtext_options(
-                s.text, s.text_size, s.font, "(h-text_h)/2", bar_text_alpha(s))
+        blur_chain += bar_drawtexts(s, "0")
         parts += [
             f"{src}split=2[base][blursrc]",
             f"[blursrc]{blur_chain}[blurredbar]",
@@ -1205,14 +1304,13 @@ def logo_filter(seg: Segment, logo: Logo, first_input: int, s: Settings) -> str:
     else:
         top = y
 
-    S = s.bar_slide_duration
-    if s.bar_height > 0 and S > 0:
-        # Slides down together with the bar (same start, duration and linear
-        # motion). Layers sticking out above the bar travel a bit further so
-        # they leave the screen when the bar does.
-        out = s.bar_slide_in_delay + S + s.bar_visible_duration
+    hidden = bar_hidden_expr(s)
+    if s.bar_height > 0 and hidden != "0":
+        # Slides in and out together with the bar (same timing, linear motion).
+        # Layers sticking out above the bar travel a bit further so they are
+        # off screen whenever the bar is.
         dist = max(s.bar_height, s.height - top)
-        motion = f"{dist}*clip((t-{out:.4f})/{S:.4f}\\,0\\,1)"
+        motion = f"{dist}*{hidden}"
     elif s.end_start is not None:   # no moving bar: slides off with the end screen
         p = f"clip((t-{s.end_start:.4f})/{END_SCREEN_FADE}\\,0\\,1)"
         motion = f"{s.height - top}*{p}*{p}*(3-2*{p})"
@@ -1451,6 +1549,7 @@ def parse_args():
     p.add_argument("--zoom-end-percent", type=float, default=105.0, help="On-screen scale of the image on its last frame before the transition, in percent (100 = no zoom, 110 = zoomed in 10%%). Only used with --zoom.")
     p.add_argument("--zoom-supersample", type=int, default=6, help="Supersample factor for the zoom stage: higher = smoother motion (less 1px stepping), but slower and more memory. Try 6-8 for short/aggressive zooms or low resolutions; 1-2 to render faster. Capped so the enlarged frame stays <=7680px wide. Only used with --zoom.")
     p.add_argument("--text", default="", help="Text to display centered in bottom bar")
+    p.add_argument("--multi-text", default="", help="JSON file with several bar appearances, each with its own text: [{\"text\": \"...\", \"start\": \"44s\", \"end\": \"74s\"}, ...]. The bar slides in at start and is gone again at end (times: seconds, \"44s\", \"1m14s\" or \"1:14\"). Replaces --text, --bar-slide-in-delay and --bar-visible-duration")
     p.add_argument("--text-size", type=int, default=114, help="Font size for bottom bar text")
     p.add_argument("--font", default="/Library/Fonts/BebasNeue-Regular.ttf", help="Optional font file path for drawtext")
     p.add_argument("--fade-name", default="mix", help="Transition between slides: 'mix' (default; a calm transition picked per slide: " + ", ".join(CALM_TRANSITIONS) + "), one FFmpeg xfade name (e.g. fade, wipeleft, circleopen) or a comma-separated list to pick from")
@@ -1503,6 +1602,67 @@ def validate_inputs(args):
     args.logo = os.path.expanduser(args.logo) if args.logo else ""
     if args.title_card and not os.path.isfile(args.title_card):
         die(f"Title card file not found: {args.title_card}")
+    if args.multi_text:
+        args.multi_text = os.path.expanduser(args.multi_text)
+        if not os.path.isfile(args.multi_text):
+            die(f"--multi-text file not found: {args.multi_text}")
+
+
+def parse_seconds(v, where: str) -> float:
+    """44 / 44.5 / "44" / "44s" / "1m14s" / "1h2m" / "1:14" / "1:02:03.5" -> seconds."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    if isinstance(v, str):
+        t = v.strip().lower().replace(" ", "")
+        try:
+            if ":" in t:
+                sec = 0.0
+                for part in t.split(":"):
+                    sec = sec * 60 + float(part)
+                return sec
+            m = re.fullmatch(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s?)?", t)
+            if t and m:
+                h, mi, se = (float(g) if g else 0.0 for g in m.groups())
+                return h * 3600 + mi * 60 + se
+        except ValueError:
+            pass
+    die(f"--multi-text: invalid time {v!r} in {where} (use e.g. 44, \"44s\", \"1m14s\" or \"1:14\")")
+
+
+def load_bar_windows(path: str, audio_duration: float) -> tuple:
+    """--multi-text JSON -> sorted ((start, end, text), ...), clipped to the audio."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        die(f"--multi-text: {path} is not valid JSON ({e}). Expected a list: "
+            '[{"text": "one", "start": "44s", "end": "74s"}, ...]')
+    if isinstance(data, dict) and isinstance(data.get("bars"), list):
+        data = data["bars"]
+    if not isinstance(data, list):
+        die(f"--multi-text: {path} must contain a list of {{\"text\", \"start\", \"end\"}} objects")
+    windows = []
+    for i, item in enumerate(data, 1):
+        where = f"entry {i}"
+        if not isinstance(item, dict) or "start" not in item or "end" not in item:
+            die(f"--multi-text: {where} needs \"start\" and \"end\"")
+        a, b = parse_seconds(item["start"], where), parse_seconds(item["end"], where)
+        if a < 0 or b <= a:
+            die(f"--multi-text: {where}: end ({b:g}s) must be after start ({a:g}s) and start >= 0")
+        if a >= audio_duration:
+            print(f"Warning: --multi-text {where} starts after the end of the video ({audio_duration:.1f}s); skipped")
+            continue
+        if b > audio_duration:
+            print(f"Warning: --multi-text {where} ends after the video; shortened to {audio_duration:.1f}s")
+            b = audio_duration
+        windows.append((a, b, str(item.get("text", ""))))
+    windows.sort(key=lambda w: w[0])
+    for (a0, b0, _), (a1, _, _) in zip(windows, windows[1:]):
+        if a1 < b0:
+            die(f"--multi-text: bar windows overlap ({a0:g}-{b0:g}s and from {a1:g}s)")
+    if not windows:
+        print("Warning: --multi-text has no entries inside the video; the bar never appears")
+    return tuple(windows)
 
 
 def default_logo_size(args) -> int:
@@ -1531,6 +1691,23 @@ def make_settings(args, audio_duration: float) -> Settings:
         # With a title card the bar rises exactly while the card glides into it.
         bar_delay = args.title_card_duration if args.title_card else 3.0
 
+    S, V = args.bar_slide_duration, args.bar_visible_duration
+    if args.multi_text:
+        if args.text:
+            print("Warning: --multi-text given; --text is ignored")
+        if args.bar_slide_in_delay is not None:
+            print("Warning: --multi-text given; --bar-slide-in-delay is ignored")
+        windows = load_bar_windows(args.multi_text, audio_duration)
+    elif S > 0:
+        windows = ((bar_delay, bar_delay + 2 * S + V, args.text),)
+    else:   # static bar for the whole video
+        windows = ((0.0, None, args.text),)
+
+    text_bar_h = (args.bar_height - max(0, args.glass_inset) if args.bar_style == "glass"
+                  else args.bar_height)
+    layout = tuple(fit_bar_text(text, args.text_size, args.font, text_bar_h)
+                   for _, _, text in windows)
+
     transitions = ([t.strip() for t in args.fade_name.split(",") if t.strip()]
                    if args.fade_name != "mix" else list(CALM_TRANSITIONS))
     if not transitions:
@@ -1548,6 +1725,7 @@ def make_settings(args, audio_duration: float) -> Settings:
         bar_alpha=args.bar_alpha, bar_blur=args.bar_blur, bar_tint=args.bar_tint,
         bar_tint_alpha=args.bar_tint_alpha, bar_slide_in_delay=bar_delay,
         bar_visible_duration=args.bar_visible_duration, bar_slide_duration=args.bar_slide_duration,
+        bar_windows=windows, bar_text_layout=layout, multi_text=bool(args.multi_text),
         glass_inset=max(0, args.glass_inset), glass_radius=max(0, args.glass_radius),
         glass_refraction=max(0, min(127, args.glass_refraction)), glass_blur=max(0.0, args.glass_blur),
         glass_tint_alpha=max(0.0, min(1.0, args.glass_tint_alpha)),
