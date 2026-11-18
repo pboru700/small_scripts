@@ -1427,7 +1427,7 @@ def parse_args():
     p.add_argument("--bar-alpha", type=float, default=0.7, help="Bar opacity for --bar-style solid (0.0 - 1.0)")
     p.add_argument("--bar-blur", type=int, default=20, help="Blur radius for --bar-style blur (boxblur radius)")
     p.add_argument("--bar-tint", default="#00464a", help="Tint color overlaid on the blurred bar for --bar-style blur (hex). Empty string disables tint.")
-    p.add_argument("--bar-tint-alpha", type=float, default=0.6, help="Opacity of the bar tint for --bar-style blur (0.0 - 1.0)")
+    p.add_argument("--bar-tint-alpha", type=float, default=0.75, help="Opacity of the bar tint for --bar-style blur (0.0 - 1.0)")
     p.add_argument("--glass-inset", type=int, default=16, help="--bar-style glass: gap between the glass and the left/right/bottom frame edges in px (default: 16)")
     p.add_argument("--glass-radius", type=int, default=0, help="--bar-style glass: corner radius in px (default: 0 = capsule, fully rounded ends)")
     p.add_argument("--glass-refraction", type=int, default=28, help="--bar-style glass: lens strength = max displacement at the rim in px, 0 disables (default: 28)")
